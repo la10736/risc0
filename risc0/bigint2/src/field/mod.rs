@@ -26,6 +26,7 @@ pub const FIELD_256_WIDTH_WORDS: usize = 256 / (WORD_SIZE * 8);
 pub const FIELD_384_WIDTH_WORDS: usize = 384 / (WORD_SIZE * 8);
 pub const EXT_DEGREE_2: usize = 2;
 pub const EXT_DEGREE_4: usize = 4;
+pub const EXT_DEGREE_6: usize = 6;
 
 const MODADD_256_BLOB: &[u8] = include_bytes_aligned!(4, "modadd_256.blob");
 const MODADD_384_BLOB: &[u8] = include_bytes_aligned!(4, "modadd_384.blob");
@@ -43,6 +44,8 @@ const EXTFIELD_DEG2_SUB_256_BLOB: &[u8] = include_bytes_aligned!(4, "extfield_de
 const EXTFIELD_DEG2_SUB_384_BLOB: &[u8] = include_bytes_aligned!(4, "extfield_deg2_sub_384.blob");
 const EXTFIELD_XXONE_MUL_256_BLOB: &[u8] = include_bytes_aligned!(4, "extfield_xxone_mul_256.blob");
 const EXTFIELD_XXONE_MUL_384_BLOB: &[u8] = include_bytes_aligned!(4, "extfield_xxone_mul_384.blob");
+const EXTFIELD_DEGSIX_MUL_384_BLOB: &[u8] = include_bytes_aligned!(4, "extfield_degsix_mul_384.blob");
+const EXTFIELD_DEGSIX_SQR_384_BLOB: &[u8] = include_bytes_aligned!(4, "extfield_degsix_sqr_384.blob");
 
 // These "unchecked" modular arithmetic operations provide no guarantee that `result < modulus`
 // This can be acceptable when computing internal results during a series of finite field
@@ -433,6 +436,42 @@ pub fn extfield_xxone_mul_384(
             rhs.as_ptr() as *const u32,
             modulus.as_ptr(),
             modsqr.as_ptr(),
+            result.as_mut_ptr() as *mut u32,
+        );
+    }
+}
+
+pub fn extfield_degsix_mul_384(
+    lhs: &[[u32; FIELD_384_WIDTH_WORDS]; EXT_DEGREE_6],
+    rhs: &[[u32; FIELD_384_WIDTH_WORDS]; EXT_DEGREE_6],
+    modulus: &[u32; FIELD_384_WIDTH_WORDS],
+    modsqr5: &[u32; 2 * FIELD_384_WIDTH_WORDS],
+    result: &mut [[u32; FIELD_384_WIDTH_WORDS]; EXT_DEGREE_6],
+) {
+    unsafe {
+        sys_bigint2_5(
+            EXTFIELD_DEGSIX_MUL_384_BLOB.as_ptr(),
+            lhs.as_ptr() as *const u32,
+            rhs.as_ptr() as *const u32,
+            modulus.as_ptr(),
+            modsqr5.as_ptr(),
+            result.as_mut_ptr() as *mut u32,
+        );
+    }
+}
+
+pub fn extfield_degsix_sqr_384(
+    inp: &[[u32; FIELD_384_WIDTH_WORDS]; EXT_DEGREE_6],
+    modulus: &[u32; FIELD_384_WIDTH_WORDS],
+    modsqr5: &[u32; 2 * FIELD_384_WIDTH_WORDS],
+    result: &mut [[u32; FIELD_384_WIDTH_WORDS]; EXT_DEGREE_6],
+) {
+    unsafe {
+        sys_bigint2_4(
+            EXTFIELD_DEGSIX_SQR_384_BLOB.as_ptr(),
+            inp.as_ptr() as *const u32,
+            modulus.as_ptr(),
+            modsqr5.as_ptr(),
             result.as_mut_ptr() as *mut u32,
         );
     }
