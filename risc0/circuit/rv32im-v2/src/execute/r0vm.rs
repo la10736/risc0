@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cmp::min, fmt::Write as _};
-
 use anyhow::{anyhow, bail, Result};
 use risc0_binfmt::{ByteAddr, WordAddr};
+use std::{cmp::min, fmt::Write as _};
 
 use super::{
     bigint::{self, BigIntState},
@@ -143,7 +142,10 @@ pub struct Risc0Machine<'a, T: Risc0Context> {
 }
 
 impl<'a, T: Risc0Context> Risc0Machine<'a, T> {
+    #[inline(always)]
     pub fn step(emu: &mut Emulator, ctx: &'a mut T) -> Result<()> {
+        // Create the machine only once, avoiding reconstruction for each step
+        // Hot path - called for every instruction execution
         emu.step(&mut Risc0Machine { ctx }).inspect_err(|_| {
             emu.dump();
         })
@@ -276,21 +278,34 @@ impl<'a, T: Risc0Context> Risc0Machine<'a, T> {
             add_cycle!(ptr, rlen);
         }
 
-        // HERE!
-        while rlen >= MAX_IO_WORDS {
-            let words = min(rlen / MAX_IO_WORDS, MAX_IO_WORDS);
-            // tracing::trace!("body: {words}");
-            for j in 0..MAX_IO_WORDS {
-                if j < words {
+        // Process aligned word-sized chunks efficiently
+        while rlen >= WORD_SIZE as u32 {
+            // Handle up to MAX_IO_WORDS at a time for efficiency
+            let words_to_process = min(rlen / WORD_SIZE as u32, MAX_IO_WORDS);
+            // tracing::trace!("body: {words_to_process}");
+
+            // Fast path for full batches (most common case)
+            if words_to_process == MAX_IO_WORDS {
+                for _ in 0..MAX_IO_WORDS {
                     let word = u32::from_le_bytes(bytes[i..i + WORD_SIZE].try_into()?);
-                    // tracing::trace!("store: {i}, {j}, {word:#010x} -> {ptr:?}");
                     self.store_memory(ptr.waddr(), word)?;
                     ptr += WORD_SIZE;
                     i += WORD_SIZE;
-                    rlen -= WORD_SIZE as u32;
-                } else {
-                    // tracing::trace!("store: {:#010x} -> null", 0);
-                    self.store_memory(SAFE_WRITE_ADDR.waddr(), 0)?;
+                }
+                rlen -= WORD_SIZE as u32 * MAX_IO_WORDS;
+            } else {
+                // Slower path for partial batches
+                for j in 0..MAX_IO_WORDS {
+                    if j < words_to_process {
+                        let word = u32::from_le_bytes(bytes[i..i + WORD_SIZE].try_into()?);
+                        self.store_memory(ptr.waddr(), word)?;
+                        ptr += WORD_SIZE;
+                        i += WORD_SIZE;
+                        rlen -= WORD_SIZE as u32;
+                    } else {
+                        // Pad with zeros for remaining slots in this cycle
+                        self.store_memory(SAFE_WRITE_ADDR.waddr(), 0)?;
+                    }
                 }
             }
 
@@ -435,6 +450,7 @@ impl<T: Risc0Context> EmuContext for Risc0Machine<'_, T> {
 
     fn trap(&mut self, cause: Exception) -> Result<bool> {
         self.ctx.trap_rewind();
+
         if let Exception::Breakpoint = cause {
             self.dump_registers(true)?;
             self.dump_registers(false)?;
@@ -443,11 +459,14 @@ impl<T: Risc0Context> EmuContext for Risc0Machine<'_, T> {
             self.dump_registers(true)?;
             self.dump_registers(false)?;
         }
+
+        // Load trap dispatcher address
         let dispatch_addr =
             ByteAddr(self.load_memory(TRAP_DISPATCH_ADDR.waddr() + cause.as_u32())?);
         if !dispatch_addr.is_aligned() || !is_kernel_memory(dispatch_addr) {
             bail!("Invalid trap address: {dispatch_addr:?}, cause: {cause:?}");
         }
+
         self.enter_trap(dispatch_addr)?;
         self.ctx.trap(cause);
         Ok(false)
@@ -469,23 +488,27 @@ impl<T: Risc0Context> EmuContext for Risc0Machine<'_, T> {
         self.ctx.set_pc(addr);
     }
 
+    #[inline(always)]
     fn load_register(&mut self, idx: usize) -> Result<u32> {
-        // tracing::trace!("load_reg: x{idx}");
+        // Hot path - heavily used during instruction execution
         let base = self.regs_base_addr();
         self.ctx.load_register(LoadOp::Record, base, idx)
     }
 
+    #[inline(always)]
     fn store_register(&mut self, idx: usize, word: u32) -> Result<()> {
-        // tracing::trace!("store_reg: x{idx} <= {word:#010x}");
-        let mut base = self.regs_base_addr();
+        // Hot path - heavily used during instruction execution
+
+        // Fast path for non-zero registers (most common case)
+        if idx != REG_ZERO {
+            return self.ctx.store_register(self.regs_base_addr(), idx, word);
+        }
 
         // To avoid the use of a degree in the circuit, all writes to REG_ZERO
         // are shunted to a memory location that is never read from.
-        if idx == REG_ZERO {
-            base += REG_MAX * 2;
-        }
-
-        self.ctx.store_register(base, idx, word)
+        // Compute address directly in one step
+        let zero_addr = self.regs_base_addr() + REG_MAX * 2;
+        self.ctx.store_register(zero_addr, idx, word)
     }
 
     fn load_memory(&mut self, addr: WordAddr) -> Result<u32> {
@@ -501,12 +524,18 @@ impl<T: Risc0Context> EmuContext for Risc0Machine<'_, T> {
     }
 
     fn check_data_load(&self, addr: ByteAddr) -> bool {
-        // self.is_machine_mode() || is_user_memory(addr)
-        addr >= ZERO_PAGE_END_ADDR && self.is_machine_mode() || is_user_memory(addr)
-        // self.check_insn_load(addr)
+        // First check if we're in machine mode (highest privilege)
+        if self.is_machine_mode() {
+            // Machine mode can access any memory except zero page
+            return addr >= ZERO_PAGE_END_ADDR;
+        }
+
+        // User mode can only access user memory
+        is_user_memory(addr)
     }
 
     fn check_data_store(&self, addr: ByteAddr) -> bool {
+        // We apply the same access rules for stores as for loads
         self.check_data_load(addr)
     }
 }

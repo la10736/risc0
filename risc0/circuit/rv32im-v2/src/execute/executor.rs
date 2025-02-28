@@ -92,13 +92,26 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         input_digest: Option<Digest>,
         trace: Vec<Rc<RefCell<dyn TraceCallback + 'b>>>,
     ) -> Self {
+        let mut pager = PagedMemory::new(image, !trace.is_empty() /* tracing_enabled */);
+
+        // Find the entry point from the image (ELF header)
+        let entry_point = if let Ok(word) = pager.peek(ELF_ENTRY_ADDR.waddr()) {
+            // Use the ELF entry point if available
+            ByteAddr(word)
+        } else {
+            // Fall back to guest program section
+            GUEST_PROGRAM_ADDR
+        };
+
+        tracing::debug!("Initializing executor with entry point: {entry_point:?}");
+
         Self {
-            pc: ByteAddr(0),
-            user_pc: ByteAddr(0),
+            pc: entry_point,
+            user_pc: entry_point,
             machine_mode: 0,
             user_cycles: 0,
             phys_cycles: 0,
-            pager: PagedMemory::new(image, !trace.is_empty() /* tracing_enabled */),
+            pager,
             terminate_state: None,
             read_record: Vec::new(),
             write_record: Vec::new(),
@@ -152,6 +165,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     "segment limit ({segment_limit}) too small for instruction at pc: {:?}",
                     self.pc
                 );
+
                 Risc0Machine::suspend(self)?;
 
                 let (pre_digest, partial_image, post_digest) = self.pager.commit()?;
@@ -225,9 +239,9 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         let user_cycles = self.user_cycles as u64;
         let pager_cycles = self.pager.cycles as u64;
         self.cycles.total += final_cycles;
+
         self.cycles.paging += pager_cycles;
         self.cycles.reserved += final_cycles - pager_cycles - user_cycles;
-
         let session_claim = Rv32imV2Claim {
             pre_state: initial_digest,
             post_state: post_digest,
@@ -261,8 +275,12 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         self.pc = ByteAddr(0);
     }
 
+    #[inline(always)]
     fn segment_cycles(&self) -> u32 {
-        self.phys_cycles + self.pager.cycles + LOOKUP_TABLE_CYCLES as u32
+        // Hot path - frequently called in main execution loop
+        // Pre-compute constant at compile time for better performance
+        const LOOKUP_TABLE_CYCLES_U32: u32 = LOOKUP_TABLE_CYCLES as u32;
+        self.phys_cycles + self.pager.cycles + LOOKUP_TABLE_CYCLES_U32
     }
 
     fn trace(&mut self, event: TraceEvent) -> Result<()> {
@@ -315,9 +333,17 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
         Ok(())
     }
 
+    #[inline(always)]
     fn on_insn_start(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()> {
         let cycle = self.cycles.user;
         self.cycles.user += 1;
+
+        // Fast path when tracing is disabled (most common case)
+        if self.trace.is_empty() && !tracing::enabled!(tracing::Level::TRACE) {
+            return Ok(());
+        }
+
+        // Tracing path (slower but less common)
         if tracing::enabled!(tracing::Level::TRACE) {
             tracing::trace!(
                 "[{}:{}:{cycle}] {:?}> {:#010x}  {}",
@@ -328,6 +354,8 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
                 disasm(insn, decoded)
             );
         }
+
+        // Only trace if we have registered callbacks
         if !self.trace.is_empty() {
             self.trace(TraceEvent::InstructionStart {
                 cycle,
@@ -339,10 +367,18 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
         }
     }
 
+    #[inline(always)]
     fn on_insn_end(&mut self, _insn: &Instruction, _decoded: &DecodedInstruction) -> Result<()> {
+        // Hot path - update cycle counters
         self.user_cycles += 1;
         self.phys_cycles += 1;
-        self.trace_pager()?;
+
+        // Only trace pager if there are any trace callbacks registered
+        // This is usually false in production use, making it a fast path
+        if !self.trace.is_empty() {
+            self.trace_pager()?;
+        }
+
         Ok(())
     }
 

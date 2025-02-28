@@ -114,30 +114,40 @@ impl PagedMemory {
         self.cycles = RESERVED_PAGING_CYCLES;
     }
 
+    #[inline]
     fn try_load_register(&self, addr: WordAddr) -> Option<u32> {
-        if addr >= USER_REGS_ADDR.waddr() && addr < USER_REGS_ADDR.waddr() + REG_MAX {
-            let reg_idx = addr - USER_REGS_ADDR.waddr();
-            Some(self.user_registers[reg_idx.0 as usize])
-        } else if addr >= MACHINE_REGS_ADDR.waddr() && addr < MACHINE_REGS_ADDR.waddr() + REG_MAX {
-            let reg_idx = addr - MACHINE_REGS_ADDR.waddr();
-            Some(self.machine_registers[reg_idx.0 as usize])
-        } else {
-            None
+        let addr_val = addr.0;
+        // Fast check for register address ranges (most common case)
+        // USER_REGS_ADDR range: 0xffff_0080 - 0xffff_00ff
+        if (addr_val & 0xffff_ff80) == 0xffff_0080 {
+            let reg_idx = (addr_val & 0x7f) >> 2; // Extract register index directly
+            return Some(self.user_registers[reg_idx as usize]);
         }
+        // MACHINE_REGS_ADDR range: 0xffff_0000 - 0xffff_007f
+        else if (addr_val & 0xffff_ff80) == 0xffff_0000 {
+            let reg_idx = (addr_val & 0x7f) >> 2; // Extract register index directly
+            return Some(self.machine_registers[reg_idx as usize]);
+        }
+        None
     }
 
+    #[inline]
     fn try_store_register(&mut self, addr: WordAddr, word: u32) -> bool {
-        if addr >= USER_REGS_ADDR.waddr() && addr < USER_REGS_ADDR.waddr() + REG_MAX {
-            let reg_idx = addr - USER_REGS_ADDR.waddr();
-            self.user_registers[reg_idx.0 as usize] = word;
-            true
-        } else if addr >= MACHINE_REGS_ADDR.waddr() && addr < MACHINE_REGS_ADDR.waddr() + REG_MAX {
-            let reg_idx = addr - MACHINE_REGS_ADDR.waddr();
-            self.machine_registers[reg_idx.0 as usize] = word;
-            true
-        } else {
-            false
+        let addr_val = addr.0;
+        // Fast check for register address ranges
+        // USER_REGS_ADDR range: 0xffff_0080 - 0xffff_00ff
+        if (addr_val & 0xffff_ff80) == 0xffff_0080 {
+            let reg_idx = (addr_val & 0x7f) >> 2; // Extract register index directly
+            self.user_registers[reg_idx as usize] = word;
+            return true;
         }
+        // MACHINE_REGS_ADDR range: 0xffff_0000 - 0xffff_007f
+        else if (addr_val & 0xffff_ff80) == 0xffff_0000 {
+            let reg_idx = (addr_val & 0x7f) >> 2; // Extract register index directly
+            self.machine_registers[reg_idx as usize] = word;
+            return true;
+        }
+        false
     }
 
     fn peek_ram(&mut self, addr: WordAddr) -> Result<u32> {
@@ -152,15 +162,19 @@ impl PagedMemory {
         }
     }
 
+    #[inline]
     pub(crate) fn peek(&mut self, addr: WordAddr) -> Result<u32> {
         if addr >= MEMORY_END_ADDR {
             bail!("Invalid peek address: {addr:?}");
         }
 
-        match self.try_load_register(addr) {
-            Some(word) => Ok(word),
-            None => self.peek_ram(addr),
+        // Check registers first (common case for hot instructions)
+        if let Some(word) = self.try_load_register(addr) {
+            return Ok(word);
         }
+
+        // Otherwise check RAM
+        self.peek_ram(addr)
     }
 
     pub(crate) fn peek_page(&mut self, page_idx: u32) -> Result<Vec<u8>> {

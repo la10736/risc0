@@ -39,6 +39,11 @@ pub const SUSPEND_CYCLE_HIGH_ADDR: ByteAddr = ByteAddr(0xffff_021c);
 pub const GLOBAL_OUTPUT_ADDR: ByteAddr = ByteAddr(0xffff_0240);
 pub const GLOBAL_INPUT_ADDR: ByteAddr = ByteAddr(0xffff_0260);
 
+// ELF entry point address (used to load the program entry point)
+pub const ELF_ENTRY_ADDR: ByteAddr = ByteAddr(0x0000_0018);
+// Default guest program section when ELF entry point is not available
+pub const GUEST_PROGRAM_ADDR: ByteAddr = ByteAddr(0x0001_0000);
+
 pub const ECALL_DISPATCH_ADDR: ByteAddr = ByteAddr(0xffff_1000);
 pub const TRAP_DISPATCH_ADDR: ByteAddr = ByteAddr(0xffff_2000);
 

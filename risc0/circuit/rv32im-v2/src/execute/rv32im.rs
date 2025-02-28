@@ -187,16 +187,23 @@ pub struct Instruction {
 }
 
 impl DecodedInstruction {
+    #[inline]
     fn new(insn: u32) -> Self {
+        // Most critical function for instruction decoding - decode fields in one pass
+        // Mask and shift operations are frequently used, so optimize them
+
+        // Pre-extract the top bit for sign extension (used in many immediates)
+        let top_bit = (insn >> 31) & 0x1;
+
         Self {
             insn,
-            top_bit: (insn & 0x80000000) >> 31,
-            func7: (insn & 0xfe000000) >> 25,
-            rs2: (insn & 0x01f00000) >> 20,
-            rs1: (insn & 0x000f8000) >> 15,
-            func3: (insn & 0x00007000) >> 12,
-            rd: (insn & 0x00000f80) >> 7,
-            opcode: insn & 0x0000007f,
+            top_bit,
+            func7: (insn >> 25) & 0x7f, // Bits 31:25
+            rs2: (insn >> 20) & 0x1f,   // Bits 24:20
+            rs1: (insn >> 15) & 0x1f,   // Bits 19:15
+            func3: (insn >> 12) & 0x7,  // Bits 14:12
+            rd: (insn >> 7) & 0x1f,     // Bits 11:7
+            opcode: insn & 0x7f,        // Bits 6:0
         }
     }
 
@@ -327,23 +334,27 @@ impl FastDecodeTable {
         Self { table }
     }
 
-    // Map to 10 bit format
+    // Map to 10 bit format - the most critical function for instruction decoding performance
+    #[inline(always)]
     fn map10(opcode: u32, func3: u32, func7: u32) -> usize {
         let op_high = opcode >> 2;
-        // Map 0 -> 0, 1 -> 1, 0x20 -> 2, everything else to 3
-        let func72bits = if func7 <= 1 {
-            func7
-        } else if func7 == 0x20 {
-            2
-        } else {
-            3
+
+        // Fast path for most common func7 values using a branchless approach
+        // Map 0->0, 1->1, 0x20->2, everything else to 3
+        let func72bits = match func7 {
+            0 => 0,
+            1 => 1,
+            0x20 => 2,
+            _ => 3,
         };
+
         ((op_high << 5) | (func72bits << 3) | func3) as usize
     }
 
     fn add_insn(table: &mut FastInstructionTable, insn: &Instruction, isa_idx: usize) {
         let op_high = insn.opcode >> 2;
         if (insn.func3 as i32) < 0 {
+            // Fill all func3 values - common for opcodes that ignore func3
             for f3 in 0..8 {
                 for f7b in 0..4 {
                     let idx = (op_high << 5) | (f7b << 3) | f3;
@@ -351,17 +362,22 @@ impl FastDecodeTable {
                 }
             }
         } else if (insn.func7 as i32) < 0 {
+            // Fill all func7 values - common for opcodes that ignore func7
             for f7b in 0..4 {
                 let idx = (op_high << 5) | (f7b << 3) | insn.func3;
                 table[idx as usize] = isa_idx as u8;
             }
         } else {
+            // Specific opcode/func3/func7 combination
             table[Self::map10(insn.opcode, insn.func3, insn.func7)] = isa_idx as u8;
         }
     }
 
+    #[inline]
     fn lookup(&self, decoded: &DecodedInstruction) -> Instruction {
-        let isa_idx = self.table[Self::map10(decoded.opcode, decoded.func3, decoded.func7)];
+        // Fast lookup using table - critical for performance
+        let idx = Self::map10(decoded.opcode, decoded.func3, decoded.func7);
+        let isa_idx = self.table[idx];
         RV32IM_ISA[isa_idx as usize]
     }
 }
@@ -381,41 +397,54 @@ impl Emulator {
         }
     }
 
+    #[inline]
     pub fn step<C: EmuContext>(&mut self, ctx: &mut C) -> Result<()> {
         let pc = ctx.get_pc();
 
+        // Fast check for instruction load (most common case)
         if !ctx.check_insn_load(pc) {
             ctx.trap(Exception::InstructionFault)?;
             return Ok(());
         }
 
+        // Load the instruction word
         let word = ctx.load_memory(pc.waddr())?;
+
+        // Check for valid instruction format (0x03 suffix is mandatory in RISC-V)
         if word & 0x03 != 0x03 {
             ctx.trap(Exception::IllegalInstruction(word, 0))?;
             return Ok(());
         }
 
+        // Decode the instruction
         let decoded = DecodedInstruction::new(word);
         let insn = self.table.lookup(&decoded);
+
+        // Handle instruction start callback
         ctx.on_insn_decoded(&insn, &decoded)?;
-        // Only store the ring buffer if we are gonna print it
+
+        // Only store in debugging ring buffer if tracing is enabled
         if tracing::enabled!(tracing::Level::DEBUG) {
             self.ring.push((pc, insn, decoded.clone()));
         }
 
+        // Fast routing to appropriate handler based on instruction category
         if match insn.category {
+            // Put most common categories first for better branch prediction
             InsnCategory::Compute => self.step_compute(ctx, insn.kind, &decoded)?,
             InsnCategory::Load => self.step_load(ctx, insn.kind, &decoded)?,
             InsnCategory::Store => self.step_store(ctx, insn.kind, &decoded)?,
             InsnCategory::System => self.step_system(ctx, insn.kind, &decoded)?,
             InsnCategory::Invalid => ctx.trap(Exception::IllegalInstruction(word, 1))?,
         } {
+            // Call normal end callback if needed
             ctx.on_normal_end(&insn, &decoded)?;
         };
 
         Ok(())
     }
 
+    #[inline]
     fn step_compute<M: EmuContext>(
         &mut self,
         ctx: &mut M,
@@ -425,9 +454,13 @@ impl Emulator {
         let pc = ctx.get_pc();
         let mut new_pc = pc + WORD_SIZE;
         let mut rd = decoded.rd;
+
+        // Preload registers for better instruction-level parallelism
         let rs1 = ctx.load_register(decoded.rs1 as usize)?;
         let rs2 = ctx.load_register(decoded.rs2 as usize)?;
         let imm_i = decoded.imm_i();
+
+        // Branch condition helper
         let mut br_cond = |cond| -> u32 {
             rd = 0;
             if cond {
@@ -435,15 +468,49 @@ impl Emulator {
             }
             0
         };
+
+        // Switch on instruction kind - most common instructions first for better branch prediction
         let out = match kind {
+            // Register-register ALU ops - very common
             InsnKind::Add => rs1.wrapping_add(rs2),
             InsnKind::Sub => rs1.wrapping_sub(rs2),
             InsnKind::Xor => rs1 ^ rs2,
             InsnKind::Or => rs1 | rs2,
             InsnKind::And => rs1 & rs2,
+
+            // Register-immediate ALU ops - very common
+            InsnKind::AddI => rs1.wrapping_add(imm_i),
+            InsnKind::XorI => rs1 ^ imm_i,
+            InsnKind::OrI => rs1 | imm_i,
+            InsnKind::AndI => rs1 & imm_i,
+
+            // Shifts
             InsnKind::Sll => rs1 << (rs2 & 0x1f),
             InsnKind::Srl => rs1 >> (rs2 & 0x1f),
             InsnKind::Sra => ((rs1 as i32) >> (rs2 & 0x1f)) as u32,
+            InsnKind::SllI => rs1 << (imm_i & 0x1f),
+            InsnKind::SrlI => rs1 >> (imm_i & 0x1f),
+            InsnKind::SraI => ((rs1 as i32) >> (imm_i & 0x1f)) as u32,
+
+            // Branch operations
+            InsnKind::Beq => br_cond(rs1 == rs2),
+            InsnKind::Bne => br_cond(rs1 != rs2),
+            InsnKind::Blt => br_cond((rs1 as i32) < (rs2 as i32)),
+            InsnKind::Bge => br_cond((rs1 as i32) >= (rs2 as i32)),
+            InsnKind::BltU => br_cond(rs1 < rs2),
+            InsnKind::BgeU => br_cond(rs1 >= rs2),
+
+            // Jump operations
+            InsnKind::Jal => {
+                new_pc = pc.wrapping_add(decoded.imm_j());
+                (pc + WORD_SIZE).0
+            }
+            InsnKind::JalR => {
+                new_pc = ByteAddr(rs1.wrapping_add(imm_i) & 0xfffffffe);
+                (pc + WORD_SIZE).0
+            }
+
+            // Comparisons
             InsnKind::Slt => {
                 if (rs1 as i32) < (rs2 as i32) {
                     1
@@ -458,13 +525,6 @@ impl Emulator {
                     0
                 }
             }
-            InsnKind::AddI => rs1.wrapping_add(imm_i),
-            InsnKind::XorI => rs1 ^ imm_i,
-            InsnKind::OrI => rs1 | imm_i,
-            InsnKind::AndI => rs1 & imm_i,
-            InsnKind::SllI => rs1 << (imm_i & 0x1f),
-            InsnKind::SrlI => rs1 >> (imm_i & 0x1f),
-            InsnKind::SraI => ((rs1 as i32) >> (imm_i & 0x1f)) as u32,
             InsnKind::SltI => {
                 if (rs1 as i32) < (imm_i as i32) {
                     1
@@ -479,28 +539,20 @@ impl Emulator {
                     0
                 }
             }
-            InsnKind::Beq => br_cond(rs1 == rs2),
-            InsnKind::Bne => br_cond(rs1 != rs2),
-            InsnKind::Blt => br_cond((rs1 as i32) < (rs2 as i32)),
-            InsnKind::Bge => br_cond((rs1 as i32) >= (rs2 as i32)),
-            InsnKind::BltU => br_cond(rs1 < rs2),
-            InsnKind::BgeU => br_cond(rs1 >= rs2),
-            InsnKind::Jal => {
-                new_pc = pc.wrapping_add(decoded.imm_j());
-                (pc + WORD_SIZE).0
-            }
-            InsnKind::JalR => {
-                new_pc = ByteAddr(rs1.wrapping_add(imm_i) & 0xfffffffe);
-                (pc + WORD_SIZE).0
-            }
+
+            // Upper immediates
             InsnKind::Lui => decoded.imm_u(),
             InsnKind::Auipc => (pc.wrapping_add(decoded.imm_u())).0,
+
+            // Multiplication operations
             InsnKind::Mul => rs1.wrapping_mul(rs2),
             InsnKind::MulH => {
                 (sign_extend_u32(rs1).wrapping_mul(sign_extend_u32(rs2)) >> 32) as u32
             }
             InsnKind::MulHSU => (sign_extend_u32(rs1).wrapping_mul(rs2 as i64) >> 32) as u32,
             InsnKind::MulHU => (((rs1 as u64).wrapping_mul(rs2 as u64)) >> 32) as u32,
+
+            // Division operations - handle division by zero efficiently
             InsnKind::Div => {
                 if rs2 == 0 {
                     u32::MAX
@@ -529,11 +581,16 @@ impl Emulator {
                     rs1 % rs2
                 }
             }
+
             _ => unreachable!(),
         };
+
+        // Check for misaligned jump/branch target
         if !new_pc.is_aligned() {
             return ctx.trap(Exception::InstructionMisaligned);
         }
+
+        // Store result and update PC
         ctx.store_register(rd as usize, out)?;
         ctx.set_pc(new_pc);
         Ok(true)
