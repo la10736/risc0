@@ -448,7 +448,7 @@ impl Emulator {
                 }
             }
             InsnKind::SltU => {
-                if rs1 < rs2 {
+                if (rs1 as i32) < (rs2 as i32) {
                     1
                 } else {
                     0
