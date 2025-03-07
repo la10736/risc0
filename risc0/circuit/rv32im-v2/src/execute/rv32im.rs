@@ -441,14 +441,14 @@ impl Emulator {
             InsnKind::Srl => rs1 >> (rs2 & 0x1f),
             InsnKind::Sra => ((rs1 as i32) >> (rs2 & 0x1f)) as u32,
             InsnKind::Slt => {
-                if rs1 < rs2 {
+                if (rs1 as i32) < (rs2 as i32) {
                     1
                 } else {
                     0
                 }
             }
             InsnKind::SltU => {
-                if (rs1 as i32) < (rs2 as i32) {
+                if rs1 < rs2 {
                     1
                 } else {
                     0
