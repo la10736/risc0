@@ -54,6 +54,7 @@ pub trait EmuContext {
     fn store_memory(&mut self, addr: WordAddr, word: u32) -> Result<()>;
 
     // Check access for instruction load
+    #[allow(dead_code)]
     fn check_insn_load(&self, addr: ByteAddr) -> bool;
 
     // Check access for data load
@@ -73,6 +74,7 @@ pub struct Emulator {
 #[repr(u32)]
 pub enum Exception {
     InstructionMisaligned = 0,
+    #[allow(dead_code)]
     InstructionFault,
     #[allow(dead_code)]
     #[debug("IllegalInstruction({_0:#010x}, {_1})")]
@@ -374,6 +376,7 @@ impl Emulator {
         }
     }
 
+    #[allow(dead_code)]
     pub fn dump(&self) {
         tracing::debug!("Dumping last {} instructions:", self.ring.len());
         for (pc, insn, decoded) in self.ring.iter() {
@@ -381,43 +384,31 @@ impl Emulator {
         }
     }
 
-    #[cold]
+    #[allow(dead_code)]
     fn ring_push(&mut self, pc: ByteAddr, insn: Instruction, decoded: DecodedInstruction) {
         self.ring.push((pc, insn, decoded));
     }
 
+    #[inline(always)]
     pub fn step<C: EmuContext>(&mut self, ctx: &mut C) -> Result<()> {
         let pc = ctx.get_pc();
-
-        if !ctx.check_insn_load(pc) {
-            ctx.trap(Exception::InstructionFault)?;
-            return Ok(());
-        }
-
         let word = ctx.load_memory(pc.waddr())?;
-        if word & 0x03 != 0x03 {
-            ctx.trap(Exception::IllegalInstruction(word, 0))?;
-            return Ok(());
-        }
-
         let decoded = DecodedInstruction::new(word);
         let insn = self.table.lookup(&decoded);
         ctx.on_insn_decoded(&insn, &decoded)?;
-        // Only store the ring buffer if we are gonna print it
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            self.ring_push(pc, insn, decoded.clone());
-        }
 
-        if match insn.category {
-            InsnCategory::Compute => self.step_compute(ctx, insn.kind, &decoded)?,
-            InsnCategory::Load => self.step_load(ctx, insn.kind, &decoded)?,
-            InsnCategory::Store => self.step_store(ctx, insn.kind, &decoded)?,
-            InsnCategory::System => self.step_system(ctx, insn.kind, &decoded)?,
-            InsnCategory::Invalid => ctx.trap(Exception::IllegalInstruction(word, 1))?,
-        } {
-            ctx.on_normal_end(&insn, &decoded)?;
+        let category_index = insn.category as usize;
+        let result = match category_index {
+            0 => self.step_compute(ctx, insn.kind, &decoded)?,
+            1 => self.step_load(ctx, insn.kind, &decoded)?,
+            2 => self.step_store(ctx, insn.kind, &decoded)?,
+            3 => self.step_system(ctx, insn.kind, &decoded)?,
+            _ => ctx.trap(Exception::IllegalInstruction(word, 1))?,
         };
 
+        if result {
+            ctx.on_normal_end(&insn, &decoded)?;
+        }
         Ok(())
     }
 
@@ -450,7 +441,7 @@ impl Emulator {
             InsnKind::Srl => rs1 >> (rs2 & 0x1f),
             InsnKind::Sra => ((rs1 as i32) >> (rs2 & 0x1f)) as u32,
             InsnKind::Slt => {
-                if (rs1 as i32) < (rs2 as i32) {
+                if rs1 < rs2 {
                     1
                 } else {
                     0

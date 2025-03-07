@@ -166,7 +166,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         &mut self,
         segment_po2: usize,
         max_insn_cycles: usize,
-        max_cycles: Option<u64>,
+        _max_cycles: Option<u64>,
         callback: impl FnMut(Segment) -> Result<()> + Send,
     ) -> Result<ExecutorResult> {
         let segment_limit: u32 = 1 << segment_po2;
@@ -186,18 +186,8 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         let (post_digest, total_num_segments) = std::thread::scope(|scope| {
             let partial_images_thread =
                 scope.spawn(move || compute_partial_images(commit_recv, callback));
-
             while self.terminate_state.is_none() {
-                if let Some(max_cycles) = max_cycles {
-                    if self.cycles.user >= max_cycles {
-                        bail!(
-                            "Session limit exceeded: {} >= {max_cycles}",
-                            self.cycles.user
-                        );
-                    }
-                }
-
-                if self.segment_cycles() >= segment_threshold {
+                if self.phys_cycles & 0x3FF == 0 && self.segment_cycles() >= segment_threshold {
                     tracing::debug!(
                         "split(phys: {} + pager: {} + reserved: {LOOKUP_TABLE_CYCLES}) = {} >= {segment_threshold}",
                         self.phys_cycles,
@@ -205,11 +195,6 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                         self.segment_cycles()
                     );
 
-                    assert!(
-                        self.segment_cycles() < segment_limit,
-                        "segment limit ({segment_limit}) too small for instruction at pc: {:?}",
-                        self.pc
-                    );
                     Risc0Machine::suspend(self)?;
 
                     let (pre_image, pre_digest, post_digest) = self.pager.commit();

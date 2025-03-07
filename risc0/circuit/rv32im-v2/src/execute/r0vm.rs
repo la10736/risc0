@@ -143,10 +143,9 @@ pub struct Risc0Machine<'a, T: Risc0Context> {
 }
 
 impl<'a, T: Risc0Context> Risc0Machine<'a, T> {
+    #[inline(always)]
     pub fn step(emu: &mut Emulator, ctx: &'a mut T) -> Result<()> {
-        emu.step(&mut Risc0Machine { ctx }).inspect_err(|_| {
-            emu.dump();
-        })
+        emu.step(&mut Risc0Machine { ctx })
     }
 
     pub fn suspend(ctx: &'a mut T) -> Result<()> {
