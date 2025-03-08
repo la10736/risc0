@@ -8,10 +8,10 @@ use num_traits::FromPrimitive as _;
 use risc0_binfmt::WordAddr;
 
 #[cfg(target_arch = "x86_64")]
-use wide::i32x8;
+use std::arch::x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+use wide::{i32x8, u32x8};
 
 use super::{
     bibc::{self, BigIntIO},
@@ -198,7 +198,6 @@ impl BigInt {
 
     // AVX2-optimized implementation
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
     unsafe fn step_avx2(
         &mut self,
         ctx: &mut dyn Risc0Context,
@@ -222,7 +221,7 @@ impl BigInt {
 
             let base_point = 128 * 256 * 64;
 
-            // Use AVX2 to process the outputs for operations that can be vectorized
+            // Use wide crate to process outputs for operations
             match insn.poly_op {
                 PolyOp::Shift | PolyOp::EqZero => {
                     self.avx2_process_output(insn.offset as usize, base_point, |v| v & 0xff)?;
@@ -242,7 +241,7 @@ impl BigInt {
                 }
             }
         } else if insn.mem_op == MemoryOp::Read {
-            // Fast load using AVX2
+            // Fast load using wide
             self.avx2_load_words(ctx, addr)?;
         } else if !addr.is_null() {
             self.state.bytes = *witness
@@ -250,7 +249,7 @@ impl BigInt {
                 .ok_or_else(|| anyhow!("Missing bigint witness: {addr:?}"))?;
 
             if insn.mem_op == MemoryOp::Write {
-                // Fast store using AVX2
+                // Fast store
                 self.avx2_store_words(ctx, addr)?;
             }
         }
@@ -270,9 +269,8 @@ impl BigInt {
         Ok(())
     }
 
-    // AVX2 helper for carry propagation
+    // AVX2 helper for carry propagation with wide
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
     unsafe fn avx2_carry_propagate(&mut self) -> Result<()> {
         let coeffs_len = self.program.total_carry.coeffs.len();
         let mut carry = 0;
@@ -280,64 +278,37 @@ impl BigInt {
         // Process 8 coefficients at a time where possible
         let mut i = 0;
         while i + 8 <= coeffs_len {
-            // Load 8 coefficients into a 256-bit vector
+            // Create the array and fill it
             let mut coeff_array = [0i32; 8];
             for j in 0..8 {
                 coeff_array[j] = self.program.total_carry.coeffs[i + j];
             }
 
-            // Set up the vector
-            let coeffs_inner = i32x8::new([
-                coeff_array[0],
-                coeff_array[1],
-                coeff_array[2],
-                coeff_array[3],
-                coeff_array[4],
-                coeff_array[5],
-                coeff_array[6],
-                coeff_array[7],
-            ]);
-            let coeffs = coeffs_inner + i32x8::splat(carry);
+            // Add carry to first element
+            coeff_array[0] += carry;
 
-            // Check if divisible by 256
-            let div_check = i32x8::splat(256);
-            let remainder = rem_epi32_wide(coeffs, div_check);
+            // Create the wide vector
+            let mut coeffs = i32x8::from(coeff_array);
 
-            // Store results back to check for errors
-            let mut remainder_array = [0i32; 8];
-            unsafe {
-                let array = remainder.to_array();
-                std::ptr::copy_nonoverlapping(
-                    array.as_ptr(),
-                    remainder_array.as_mut_ptr() as *mut i32,
-                    8,
-                );
-            }
-
-            // Check remainders - if not divisible by 256, error out
-            for rem in &remainder_array {
-                if *rem != 0 {
+            // Check divisibility by 256
+            for j in 0..8 {
+                if coeff_array[j] % 256 != 0 {
                     bail!("bad carry");
                 }
             }
 
             // Divide by 256
-            let coeffs = div_epi32_wide(coeffs, div_check);
-
-            // Store results back
-            let mut result_array = [0i32; 8];
-            unsafe {
-                let array = coeffs.to_array();
-                std::ptr::copy_nonoverlapping(array.as_ptr(), result_array.as_mut_ptr(), 8);
-            }
-
-            // Store back to coeffs
             for j in 0..8 {
-                self.program.total_carry.coeffs[i + j] = result_array[j];
+                coeff_array[j] /= 256;
             }
 
-            // Update carry
-            carry = result_array[7];
+            // Update coefficients
+            for j in 0..8 {
+                self.program.total_carry.coeffs[i + j] = coeff_array[j];
+            }
+
+            // Update carry for next batch
+            carry = coeff_array[7];
             i += 8;
         }
 
@@ -353,9 +324,8 @@ impl BigInt {
         Ok(())
     }
 
-    // AVX2 helper for processing output values in parallel
+    // AVX2 helper for processing outputs using wide vectors
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
     unsafe fn avx2_process_output<F>(
         &mut self,
         offset: usize,
@@ -365,43 +335,26 @@ impl BigInt {
     where
         F: Fn(u32) -> u32,
     {
-        // Process 8 elements at a time where possible
-        let base_point_vec = i32x8::splat(base_point as i32);
-
         // Process 8 bytes at a time
         let chunk_size = 8;
         let mut i = 0;
 
         while i + chunk_size <= BIGINT_WIDTH_BYTES {
-            // Load coefficients into a vector
-            let mut coeff_array = [0i32; 8];
+            // Load coefficients into array
+            let mut coeff_array = [0u32; 8];
             for j in 0..chunk_size {
                 coeff_array[j] =
-                    self.program.total_carry.coeffs[offset * BIGINT_WIDTH_BYTES + i + j] as i32;
+                    self.program.total_carry.coeffs[offset * BIGINT_WIDTH_BYTES + i + j] as u32;
             }
 
-            // Load into AVX2 register
-            let coeffs_inner = i32x8::new([
-                coeff_array[0],
-                coeff_array[1],
-                coeff_array[2],
-                coeff_array[3],
-                coeff_array[4],
-                coeff_array[5],
-                coeff_array[6],
-                coeff_array[7],
-            ]);
-            let coeffs = coeffs_inner + base_point_vec;
-
-            // Add base_point
-            let values = coeffs;
-
-            // Store to temporary array
-            let values_array = values.to_array();
-
-            // Apply processing function and store result
+            // Add base_point to each
             for j in 0..chunk_size {
-                self.state.bytes[i + j] = process_fn(values_array[j] as u32) as u8;
+                coeff_array[j] = coeff_array[j].wrapping_add(base_point);
+            }
+
+            // Process each value and store result
+            for j in 0..chunk_size {
+                self.state.bytes[i + j] = process_fn(coeff_array[j]) as u8;
             }
 
             i += chunk_size;
@@ -418,9 +371,8 @@ impl BigInt {
         Ok(())
     }
 
-    // AVX2 helper for loading words
+    // Optimized word loading
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
     unsafe fn avx2_load_words(&mut self, ctx: &mut dyn Risc0Context, addr: WordAddr) -> Result<()> {
         // Load all words at once
         let mut words = [0u32; BIGINT_WIDTH_WORDS];
@@ -428,50 +380,11 @@ impl BigInt {
             words[i] = ctx.load_u32(LoadOp::Record, addr + i)?;
         }
 
-        // Use AVX2 to convert to bytes
-        if BIGINT_WIDTH_WORDS == 4 {
-            // This works for exactly 16 bytes (4 words)
-            // Load the 4 words (128 bits)
-            let word_vec = i32x8::new([
-                words[0] as i32,
-                words[1] as i32,
-                words[2] as i32,
-                words[3] as i32,
-                0,
-                0,
-                0,
-                0,
-            ]);
-
-            // Shuffle bytes to convert from little-endian
-            // This converts 4 32-bit integers to 16 bytes
-            let words_array = word_vec.to_array();
-            let mut bytes_array = [0i32; 8];
-            // Implement shuffle manually using array indexes
-            bytes_array[0] = words_array[0];
-            bytes_array[1] = words_array[1];
-            bytes_array[2] = words_array[2];
-            bytes_array[3] = words_array[3];
-            bytes_array[4] = words_array[4];
-            bytes_array[5] = words_array[5];
-            bytes_array[6] = words_array[6];
-            bytes_array[7] = words_array[7];
-
-            // Store the result
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes_array.as_ptr(),
-                    self.state.bytes.as_mut_ptr() as *mut i32,
-                    8,
-                );
-            }
-        } else {
-            // Fallback for different sizes
-            for i in 0..BIGINT_WIDTH_WORDS {
-                let bytes = words[i].to_le_bytes();
-                for j in 0..WORD_SIZE {
-                    self.state.bytes[i * WORD_SIZE + j] = bytes[j];
-                }
+        // Convert words to bytes (vanilla implementation for compatibility)
+        for i in 0..BIGINT_WIDTH_WORDS {
+            let bytes = words[i].to_le_bytes();
+            for j in 0..WORD_SIZE {
+                self.state.bytes[i * WORD_SIZE + j] = bytes[j];
             }
         }
 
@@ -480,7 +393,6 @@ impl BigInt {
 
     // AVX2 helper for storing words
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
     unsafe fn avx2_store_words(
         &mut self,
         ctx: &mut dyn Risc0Context,
@@ -578,52 +490,13 @@ impl BigIntIO for BigIntIOImpl<'_> {
         // Copy bytes into witness buffer
         witness[..bytes.len()].copy_from_slice(&bytes);
 
-        // Process in chunks - use SIMD if available for copying
-        #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2") && BIGINT_WIDTH_BYTES % 32 == 0 {
-            unsafe {
-                let chunks = witness.chunks_exact(BIGINT_WIDTH_BYTES);
-                assert_eq!(chunks.len(), count as usize / BIGINT_WIDTH_BYTES);
-
-                for (i, chunk) in chunks.enumerate() {
-                    let chunk_addr = addr + i * BIGINT_WIDTH_WORDS;
-                    let chunk_bytes: BigIntBytes = chunk.try_into().unwrap();
-
-                    // Use AVX2 to copy chunks
-                    let chunks_avx = (BIGINT_WIDTH_BYTES / 32) as usize;
-                    for j in 0..chunks_avx {
-                        let src_ptr = chunk.as_ptr().add(j * 32) as *const i32;
-                        let values = i32x8::new([
-                            src_ptr.add(0).read_unaligned(),
-                            src_ptr.add(1).read_unaligned(),
-                            src_ptr.add(2).read_unaligned(),
-                            src_ptr.add(3).read_unaligned(),
-                            src_ptr.add(4).read_unaligned(),
-                            src_ptr.add(5).read_unaligned(),
-                            src_ptr.add(6).read_unaligned(),
-                            src_ptr.add(7).read_unaligned(),
-                        ]);
-                        let values_array = values.to_array();
-                        let dst_ptr = self.witness.get_mut(&chunk_addr).unwrap().as_mut_ptr();
-
-                        std::ptr::copy_nonoverlapping(
-                            values_array.as_ptr(),
-                            dst_ptr.add(j * 8) as *mut i32,
-                            8,
-                        );
-                    }
-
-                    self.witness.insert(chunk_addr, chunk_bytes);
-                }
-            }
-        } else {
-            let chunks = witness.chunks_exact(BIGINT_WIDTH_BYTES);
-            assert_eq!(chunks.len(), count as usize / BIGINT_WIDTH_BYTES);
-            for (i, chunk) in chunks.enumerate() {
-                let chunk_addr = addr + i * BIGINT_WIDTH_WORDS;
-                let chunk_bytes: BigIntBytes = chunk.try_into().unwrap();
-                self.witness.insert(chunk_addr, chunk_bytes);
-            }
+        // Process in chunks
+        let chunks = witness.chunks_exact(BIGINT_WIDTH_BYTES);
+        assert_eq!(chunks.len(), count as usize / BIGINT_WIDTH_BYTES);
+        for (i, chunk) in chunks.enumerate() {
+            let chunk_addr = addr + i * BIGINT_WIDTH_WORDS;
+            let chunk_bytes: BigIntBytes = chunk.try_into().unwrap();
+            self.witness.insert(chunk_addr, chunk_bytes);
         }
 
         Ok(())
@@ -643,14 +516,15 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     let verify_program_size = ctx.load_u32(LoadOp::Load, blob_ptr + 1)?;
     let consts_size = ctx.load_u32(LoadOp::Load, blob_ptr + 2)?;
 
-    // Prefetch program bytes
+    // Prefetch program bytes - only if avx2 supported
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("sse4.1") {
         unsafe {
             // Prefetch the program bytes
             let addr_ptr = nondet_program_ptr.baddr().0 as *const i8;
             for i in 0..(nondet_program_size as usize * WORD_SIZE / 64) {
-                _mm_prefetch(addr_ptr.add(i * 64), _MM_HINT_T0);
+                // Use _MM_HINT_T0 (3) for highest priority prefetch
+                _mm_prefetch(addr_ptr.add(i * 64), 3);
             }
         }
     }
@@ -696,57 +570,4 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     };
 
     bigint.run(ctx, &witness)
-}
-
-#[inline(always)]
-#[cfg(target_arch = "x86_64")]
-unsafe fn div_epi32_wide(a: i32x8, b: i32x8) -> i32x8 {
-    let mut result_arr = [0i32; 8];
-
-    // Use as_array() to access elements
-    let a_arr = a.to_array();
-    let b_arr = b.to_array();
-
-    for i in 0..8 {
-        let a_val = a_arr[i];
-        let b_val = b_arr[i];
-        result_arr[i] = if b_val != 0 { a_val / b_val } else { 0 };
-    }
-
-    i32x8::new([
-        result_arr[0],
-        result_arr[1],
-        result_arr[2],
-        result_arr[3],
-        result_arr[4],
-        result_arr[5],
-        result_arr[6],
-        result_arr[7],
-    ])
-}
-
-#[inline(always)]
-#[cfg(target_arch = "x86_64")]
-unsafe fn rem_epi32_wide(a: i32x8, b: i32x8) -> i32x8 {
-    let mut result_arr = a.to_array();
-    let b_arr = b.to_array();
-
-    for i in 0..8 {
-        result_arr[i] = if b_arr[i] != 0 {
-            result_arr[i] % b_arr[i]
-        } else {
-            result_arr[i]
-        };
-    }
-
-    i32x8::new([
-        result_arr[0],
-        result_arr[1],
-        result_arr[2],
-        result_arr[3],
-        result_arr[4],
-        result_arr[5],
-        result_arr[6],
-        result_arr[7],
-    ])
 }
