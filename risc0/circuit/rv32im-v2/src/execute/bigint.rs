@@ -10,9 +10,6 @@ use risc0_binfmt::WordAddr;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-#[cfg(target_arch = "x86_64")]
-use wide::i32x8;
-
 use super::{
     bibc::{self, BigIntIO},
     byte_poly::BytePolyProgram,
