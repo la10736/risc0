@@ -14,6 +14,13 @@
 
 use std::{collections::HashMap, io::Cursor};
 
+use anyhow::{anyhow, bail, ensure, Result};
+use derive_more::Debug;
+use malachite::Natural;
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive as _;
+use risc0_binfmt::WordAddr;
+
 use super::{
     bibc::{self, BigIntIO},
     byte_poly::BytePolyProgram,
@@ -21,12 +28,6 @@ use super::{
     r0vm::{LoadOp, Risc0Context},
     CycleState,
 };
-use anyhow::{anyhow, bail, ensure, Result};
-use derive_more::Debug;
-use malachite::Natural;
-use num_derive::FromPrimitive;
-use num_traits::FromPrimitive as _;
-use risc0_binfmt::WordAddr;
 
 pub(crate) const BIGINT_STATE_COUNT: usize = 5 + 16;
 pub(crate) const BIGINT_ACCUM_STATE_COUNT: usize = 3 * 4;
@@ -119,14 +120,23 @@ impl BigInt {
         let addr = base + insn.offset * BIGINT_WIDTH_WORDS as u32;
 
         tracing::trace!("step({:?}, {insn:?}, {addr:?})", self.state.pc);
-        if insn.mem_op == MemoryOp::Check {
+        if insn.mem_op == MemoryOp::Check && insn.poly_op != PolyOp::Reset {
             if !self.program.in_carry {
                 self.program.in_carry = true;
                 self.program.total_carry = self.program.total.clone();
-                propagate_carry_hybrid(&mut self.program.total_carry.coeffs)?;
+                let mut carry = 0;
+
+                // Do carry propagation
+                for coeff in self.program.total_carry.coeffs.iter_mut() {
+                    *coeff += carry;
+                    ensure!(*coeff % 256 == 0, "bad carry");
+                    *coeff /= 256;
+                    carry = *coeff;
+                }
+                tracing::trace!("carry propagate complete");
             }
 
-            let base_point = 0x4000; // 16384, matches shifting logic
+            let base_point = 0x200000;
             for (i, ret) in self.state.bytes.iter_mut().enumerate() {
                 let offset = insn.offset as usize;
                 let coeff = self.program.total_carry.coeffs[offset * BIGINT_WIDTH_BYTES + i] as u32;
@@ -135,7 +145,9 @@ impl BigInt {
                     PolyOp::Carry1 => *ret = ((value >> 14) & 0xff) as u8,
                     PolyOp::Carry2 => *ret = ((value >> 8) & 0x3f) as u8,
                     PolyOp::Shift | PolyOp::EqZero => *ret = (value & 0xff) as u8,
-                    _ => bail!("Invalid poly_op in bigint program"),
+                    _ => {
+                        bail!("Invalid poly_op in bigint program")
+                    }
                 }
             }
         } else if insn.mem_op == MemoryOp::Read {
@@ -303,29 +315,4 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     };
 
     bigint.run(ctx, &witness)
-}
-
-fn propagate_carry_hybrid(total_carry: &mut [i32]) -> Result<()> {
-    let mut scalar_carry = 0;
-
-    // Process chunks of 8, but with sequential carry between elements
-    for chunk in total_carry.chunks_exact_mut(8) {
-        // Load current values
-        for value in chunk.iter_mut() {
-            *value += scalar_carry;
-            ensure!(*value % 256 == 0, "bad carry");
-            *value /= 256;
-            scalar_carry = *value;
-        }
-    }
-
-    // Handle remaining elements
-    for coeff in total_carry.chunks_exact_mut(8).into_remainder() {
-        *coeff += scalar_carry;
-        ensure!(*coeff % 256 == 0, "bad carry");
-        *coeff /= 256;
-        scalar_carry = *coeff;
-    }
-
-    Ok(())
 }
