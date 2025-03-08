@@ -11,7 +11,7 @@ use risc0_binfmt::WordAddr;
 use std::arch::x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
-use wide::{i32x8, u32x8};
+use wide::i32x8;
 
 use super::{
     bibc::{self, BigIntIO},
@@ -286,9 +286,6 @@ impl BigInt {
 
             // Add carry to first element
             coeff_array[0] += carry;
-
-            // Create the wide vector
-            let mut coeffs = i32x8::from(coeff_array);
 
             // Check divisibility by 256
             for j in 0..8 {
