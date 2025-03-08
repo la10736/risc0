@@ -337,7 +337,7 @@ fn propagate_carry_simd(total_carry: &mut [i32]) -> Result<()> {
         carry = i32x8::new(new_vec_array);
 
         // Store results back
-        coeffs.copy_from_slice(&vec_array);
+        coeffs.copy_from_slice(&new_vec_array);
     }
 
     // Handle remaining elements
