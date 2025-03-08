@@ -27,7 +27,6 @@ use malachite::Natural;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive as _;
 use risc0_binfmt::WordAddr;
-use wide::i32x8;
 
 pub(crate) const BIGINT_STATE_COUNT: usize = 5 + 16;
 pub(crate) const BIGINT_ACCUM_STATE_COUNT: usize = 3 * 4;
@@ -124,7 +123,7 @@ impl BigInt {
             if !self.program.in_carry {
                 self.program.in_carry = true;
                 self.program.total_carry = self.program.total.clone();
-                propagate_carry_simd(&mut self.program.total_carry.coeffs)?;
+                propagate_carry_hybrid(&mut self.program.total_carry.coeffs)?;
             }
 
             let base_point = 0x4000; // 16384, matches shifting logic
@@ -306,46 +305,23 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     bigint.run(ctx, &witness)
 }
 
-// SIMD version of carry propagation for signed integers
-fn propagate_carry_simd(total_carry: &mut [i32]) -> Result<()> {
-    let mut carry = i32x8::splat(0);
+fn propagate_carry_hybrid(total_carry: &mut [i32]) -> Result<()> {
+    let mut scalar_carry = 0;
 
-    for coeffs in total_carry.chunks_exact_mut(8) {
-        // Load 8 elements at once
-        let old_vec = i32x8::new([
-            coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4], coeffs[5], coeffs[6], coeffs[7],
-        ]);
-
-        // Add carry
-        let vec_with_carry = old_vec + carry;
-
-        // Calculate remainder manually
-        let mut remainder_array = [0i32; 8];
-        let mut new_vec_array = [0i32; 8];
-        let vec_array = vec_with_carry.to_array();
-
-        for i in 0..8 {
-            remainder_array[i] = vec_array[i] % 256;
-            new_vec_array[i] = vec_array[i] / 256;
+    // Process chunks of 8, but with sequential carry between elements
+    for chunk in total_carry.chunks_exact_mut(8) {
+        // Load current values
+        for value in chunk.iter_mut() {
+            *value += scalar_carry;
+            ensure!(*value % 256 == 0, "bad carry");
+            *value /= 256;
+            scalar_carry = *value;
         }
-
-        // Check remainder
-        let remainder = i32x8::new(remainder_array);
-        tracing::debug!("remainder: {remainder:?}");
-        ensure!(remainder == i32x8::splat(0), "bad carry");
-
-        // Create new vector and save as carry
-        carry = i32x8::new(new_vec_array);
-
-        // Store results back
-        coeffs.copy_from_slice(&new_vec_array);
     }
 
     // Handle remaining elements
-    let mut scalar_carry = carry.to_array()[7];
     for coeff in total_carry.chunks_exact_mut(8).into_remainder() {
         *coeff += scalar_carry;
-        tracing::debug!("coeff: {coeff:?}");
         ensure!(*coeff % 256 == 0, "bad carry");
         *coeff /= 256;
         scalar_carry = *coeff;
