@@ -287,21 +287,17 @@ impl BigInt {
             }
 
             // Set up the vector
-            unsafe {
-                let mut array = [0i32; 8];
-                std::ptr::copy_nonoverlapping(
-                    coeff_array.as_ptr() as *const i32,
-                    array.as_mut_ptr(),
-                    8,
-                );
-                let coeffs = i32x8::new([
-                    array[0], array[1], array[2], array[3], array[4], array[5], array[6], array[7],
-                ]);
-            }
-
-            // Add the carry to the first element
-            let carry_vec = i32x8::splat(carry);
-            let mut coeffs = coeffs + carry_vec;
+            let coeffs_inner = i32x8::new([
+                coeff_array[0],
+                coeff_array[1],
+                coeff_array[2],
+                coeff_array[3],
+                coeff_array[4],
+                coeff_array[5],
+                coeff_array[6],
+                coeff_array[7],
+            ]);
+            let mut coeffs = coeffs_inner + i32x8::splat(carry);
 
             // Check if divisible by 256
             let div_check = i32x8::splat(256);
@@ -385,27 +381,23 @@ impl BigInt {
             }
 
             // Load into AVX2 register
-            unsafe {
-                let mut array = [0i32; 8];
-                std::ptr::copy_nonoverlapping(
-                    coeff_array.as_ptr() as *const i32,
-                    array.as_mut_ptr(),
-                    8,
-                );
-                let coeffs = i32x8::new([
-                    array[0], array[1], array[2], array[3], array[4], array[5], array[6], array[7],
-                ]);
-            }
+            let coeffs_inner = i32x8::new([
+                coeff_array[0],
+                coeff_array[1],
+                coeff_array[2],
+                coeff_array[3],
+                coeff_array[4],
+                coeff_array[5],
+                coeff_array[6],
+                coeff_array[7],
+            ]);
+            let mut coeffs = coeffs_inner + base_point_vec;
 
             // Add base_point
-            let values = coeffs + base_point_vec;
+            let values = coeffs;
 
             // Store to temporary array
-            let mut values_array = [0i32; 8];
-            unsafe {
-                let array = values.to_array();
-                std::ptr::copy_nonoverlapping(array.as_ptr(), values_array.as_mut_ptr(), 8);
-            }
+            let values_array = values.to_array();
 
             // Apply processing function and store result
             for j in 0..chunk_size {
@@ -466,7 +458,13 @@ impl BigInt {
             bytes_array[7] = words_array[7];
 
             // Store the result
-            bytes_array.write_to_slice_unaligned(self.state.bytes.as_mut_ptr() as *mut i32);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes_array.as_ptr(),
+                    self.state.bytes.as_mut_ptr() as *mut i32,
+                    8,
+                );
+            }
         } else {
             // Fallback for different sizes
             for i in 0..BIGINT_WIDTH_WORDS {
@@ -605,10 +603,15 @@ impl BigIntIO for BigIntIOImpl<'_> {
                             src_ptr.add(6).read_unaligned(),
                             src_ptr.add(7).read_unaligned(),
                         ]);
-                        values.write_to_slice_unaligned(std::slice::from_raw_parts_mut(
-                            self.witness.get_mut(&chunk_addr).unwrap().as_mut_ptr(),
-                            8,
-                        ));
+                        let values_array = values.to_array();
+                        let dst_ptr = self.witness.get_mut(&chunk_addr).unwrap().as_mut_ptr();
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                values_array.as_ptr(),
+                                dst_ptr.add(j * 8) as *mut i32,
+                                8,
+                            );
+                        }
                     }
 
                     self.witness.insert(chunk_addr, chunk_bytes);
