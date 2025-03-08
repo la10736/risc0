@@ -6,6 +6,8 @@ use malachite::Natural;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive as _;
 use risc0_binfmt::WordAddr;
+
+#[cfg(target_arch = "x86_64")]
 use wide::{i32x8, u32x8};
 
 #[cfg(target_arch = "x86_64")]
@@ -285,11 +287,21 @@ impl BigInt {
             }
 
             // Set up the vector
-            let mut coeffs = i32x8::from_slice_unaligned(coeff_array.as_ptr() as *const i32);
+            unsafe {
+                let mut array = [0i32; 8];
+                std::ptr::copy_nonoverlapping(
+                    coeff_array.as_ptr() as *const i32,
+                    array.as_mut_ptr(),
+                    8,
+                );
+                let coeffs = i32x8::new(
+                    array[0], array[1], array[2], array[3], array[4], array[5], array[6], array[7],
+                );
+            }
 
             // Add the carry to the first element
             let carry_vec = i32x8::splat(carry);
-            coeffs = coeffs + carry_vec;
+            let coeffs = coeffs + carry_vec;
 
             // Check if divisible by 256
             let div_check = i32x8::splat(256);
@@ -297,7 +309,14 @@ impl BigInt {
 
             // Store results back to check for errors
             let mut remainder_array = [0i32; 8];
-            remainder.write_to_slice_unaligned(remainder_array.as_mut_ptr() as *mut i32);
+            unsafe {
+                let array = remainder.as_array();
+                std::ptr::copy_nonoverlapping(
+                    array.as_ptr(),
+                    remainder_array.as_mut_ptr() as *mut i32,
+                    8,
+                );
+            }
 
             // Check remainders - if not divisible by 256, error out
             for rem in &remainder_array {
@@ -307,11 +326,14 @@ impl BigInt {
             }
 
             // Divide by 256
-            coeffs = div_epi32_wide(coeffs, div_check);
+            let coeffs = div_epi32_wide(coeffs, div_check);
 
             // Store results back
             let mut result_array = [0i32; 8];
-            coeffs.write_to_slice_unaligned(result_array.as_mut_ptr() as *mut i32);
+            unsafe {
+                let array = coeffs.as_array();
+                std::ptr::copy_nonoverlapping(array.as_ptr(), result_array.as_mut_ptr(), 8);
+            }
 
             // Store back to coeffs
             for j in 0..8 {
@@ -363,14 +385,27 @@ impl BigInt {
             }
 
             // Load into AVX2 register
-            let coeffs = i32x8::from_slice_unaligned(coeff_array.as_ptr() as *const i32);
+            unsafe {
+                let mut array = [0i32; 8];
+                std::ptr::copy_nonoverlapping(
+                    coeff_array.as_ptr() as *const i32,
+                    array.as_mut_ptr(),
+                    8,
+                );
+                let coeffs = i32x8::new(
+                    array[0], array[1], array[2], array[3], array[4], array[5], array[6], array[7],
+                );
+            }
 
             // Add base_point
             let values = coeffs + base_point_vec;
 
             // Store to temporary array
             let mut values_array = [0i32; 8];
-            values.write_to_slice_unaligned(values_array.as_mut_ptr() as *mut i32);
+            unsafe {
+                let array = values.as_array();
+                std::ptr::copy_nonoverlapping(array.as_ptr(), values_array.as_mut_ptr(), 8);
+            }
 
             // Apply processing function and store result
             for j in 0..chunk_size {
@@ -405,7 +440,12 @@ impl BigInt {
         if BIGINT_WIDTH_WORDS == 4 {
             // This works for exactly 16 bytes (4 words)
             // Load the 4 words (128 bits)
-            let word_vec = i32x8::from_slice_unaligned(words.as_ptr() as *const i32);
+            let word_vec = i32x8::new(
+                words[0] as i32,
+                words[1] as i32,
+                words[2] as i32,
+                words[3] as i32,
+            );
 
             // Shuffle bytes to convert from little-endian
             // This converts 4 32-bit integers to 16 bytes
@@ -545,8 +585,16 @@ impl BigIntIO for BigIntIOImpl<'_> {
                     let chunks_avx = (BIGINT_WIDTH_BYTES / 32) as usize;
                     for j in 0..chunks_avx {
                         let src_ptr = chunk.as_ptr().add(j * 32) as *const i32;
-                        let values =
-                            i32x8::from_slice_unaligned(std::slice::from_raw_parts(src_ptr, 8));
+                        let values = i32x8::new(
+                            src_ptr.add(0).read_unaligned(),
+                            src_ptr.add(1).read_unaligned(),
+                            src_ptr.add(2).read_unaligned(),
+                            src_ptr.add(3).read_unaligned(),
+                            src_ptr.add(4).read_unaligned(),
+                            src_ptr.add(5).read_unaligned(),
+                            src_ptr.add(6).read_unaligned(),
+                            src_ptr.add(7).read_unaligned(),
+                        );
                         values.write_to_slice_unaligned(std::slice::from_raw_parts_mut(
                             self.witness.get_mut(&chunk_addr).unwrap().as_mut_ptr(),
                             8,
