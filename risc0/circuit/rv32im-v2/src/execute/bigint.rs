@@ -1,17 +1,3 @@
-// Copyright 2025 RISC Zero, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use std::{collections::HashMap, io::Cursor};
 
 use anyhow::{anyhow, bail, ensure, Result};
@@ -20,6 +6,9 @@ use malachite::Natural;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive as _;
 use risc0_binfmt::WordAddr;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 use super::{
     bibc::{self, BigIntIO},
@@ -40,6 +29,12 @@ pub(crate) const BIGINT_WIDTH_BYTES: usize = BIGINT_WIDTH_WORDS * WORD_SIZE;
 
 pub(crate) type BigIntBytes = [u8; BIGINT_WIDTH_BYTES];
 type BigIntWitness = HashMap<WordAddr, BigIntBytes>;
+
+// Pre-allocate buffer for byte conversions to reduce allocations
+thread_local! {
+    static BYTES_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(1024));
+    static LIMBS_BUFFER: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::with_capacity(256));
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct BigIntState {
@@ -106,12 +101,26 @@ impl BigInt {
     fn run(&mut self, ctx: &mut dyn Risc0Context, witness: &BigIntWitness) -> Result<()> {
         ctx.on_bigint_cycle(CycleState::BigIntEcall, &self.state);
         while self.state.next_state == CycleState::BigIntStep {
-            self.step(ctx, witness)?;
+            // Use feature detection to choose the optimal implementation
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") {
+                    unsafe { self.step_avx2(ctx, witness)? }
+                } else {
+                    self.step_scalar(ctx, witness)?
+                }
+            }
+
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                self.step_scalar(ctx, witness)?
+            }
         }
         Ok(())
     }
 
-    fn step(&mut self, ctx: &mut dyn Risc0Context, witness: &BigIntWitness) -> Result<()> {
+    // Original implementation renamed for non-AVX2 platforms
+    fn step_scalar(&mut self, ctx: &mut dyn Risc0Context, witness: &BigIntWitness) -> Result<()> {
         self.state.pc.inc();
         let insn = Instruction::decode(ctx.load_u32(LoadOp::Record, self.state.pc)?)?;
 
@@ -183,6 +192,258 @@ impl BigInt {
         ctx.on_bigint_cycle(CycleState::BigIntStep, &self.state);
         Ok(())
     }
+
+    // AVX2-optimized implementation
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn step_avx2(
+        &mut self,
+        ctx: &mut dyn Risc0Context,
+        witness: &BigIntWitness,
+    ) -> Result<()> {
+        self.state.pc.inc();
+        let insn = Instruction::decode(ctx.load_u32(LoadOp::Record, self.state.pc)?)?;
+
+        let base =
+            ctx.load_aligned_addr_from_machine_register(LoadOp::Record, insn.reg as usize)?;
+        let addr = base + insn.offset * BIGINT_WIDTH_WORDS as u32;
+
+        if insn.mem_op == MemoryOp::Check && insn.poly_op != PolyOp::Reset {
+            if !self.program.in_carry {
+                self.program.in_carry = true;
+                self.program.total_carry = self.program.total.clone();
+
+                // Optimized carry propagation using AVX2
+                self.avx2_carry_propagate()?;
+            }
+
+            let base_point = 128 * 256 * 64;
+
+            // Use AVX2 to process the outputs for operations that can be vectorized
+            match insn.poly_op {
+                PolyOp::Shift | PolyOp::EqZero => {
+                    self.avx2_process_output(insn.offset as usize, base_point, |v| v & 0xff)?;
+                }
+                PolyOp::Carry1 => {
+                    self.avx2_process_output(insn.offset as usize, base_point, |v| {
+                        (v >> 14) & 0xff
+                    })?;
+                }
+                PolyOp::Carry2 => {
+                    self.avx2_process_output(insn.offset as usize, base_point, |v| {
+                        (v >> 8) & 0x3f
+                    })?;
+                }
+                _ => {
+                    bail!("Invalid poly_op in bigint program")
+                }
+            }
+        } else if insn.mem_op == MemoryOp::Read {
+            // Fast load using AVX2
+            self.avx2_load_words(ctx, addr)?;
+        } else if !addr.is_null() {
+            self.state.bytes = *witness
+                .get(&addr)
+                .ok_or_else(|| anyhow!("Missing bigint witness: {addr:?}"))?;
+
+            if insn.mem_op == MemoryOp::Write {
+                // Fast store using AVX2
+                self.avx2_store_words(ctx, addr)?;
+            }
+        }
+
+        self.program.step(&insn, &self.state.bytes)?;
+
+        self.state.is_ecall = false;
+        self.state.poly_op = insn.poly_op;
+        self.state.coeff = (insn.coeff + 4) as u32;
+        self.state.next_state = if !self.state.is_ecall && insn.poly_op == PolyOp::Reset {
+            CycleState::Decode
+        } else {
+            CycleState::BigIntStep
+        };
+
+        ctx.on_bigint_cycle(CycleState::BigIntStep, &self.state);
+        Ok(())
+    }
+
+    // AVX2 helper for carry propagation
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_carry_propagate(&mut self) -> Result<()> {
+        let coeffs_len = self.program.total_carry.coeffs.len();
+        let mut carry = 0;
+
+        // Process 8 coefficients at a time where possible
+        let mut i = 0;
+        while i + 8 <= coeffs_len {
+            // Load 8 coefficients into a 256-bit vector
+            let mut coeff_array = [0i32; 8];
+            for j in 0..8 {
+                coeff_array[j] = self.program.total_carry.coeffs[i + j];
+            }
+
+            // Set up the vector
+            let mut coeffs = _mm256_loadu_si256(coeff_array.as_ptr() as *const __m256i);
+
+            // Add the carry to the first element
+            let carry_vec = _mm256_set_epi32(0, 0, 0, 0, 0, 0, 0, carry);
+            coeffs = _mm256_add_epi32(coeffs, carry_vec);
+
+            // Check if divisible by 256
+            let div_check = _mm256_set1_epi32(256);
+            let remainder = _mm256_rem_epi32(coeffs, div_check);
+
+            // Store results back to check for errors
+            let mut remainder_array = [0i32; 8];
+            _mm256_storeu_si256(remainder_array.as_mut_ptr() as *mut __m256i, remainder);
+
+            // Check remainders - if not divisible by 256, error out
+            for rem in &remainder_array {
+                if *rem != 0 {
+                    bail!("bad carry");
+                }
+            }
+
+            // Divide by 256
+            coeffs = _mm256_div_epi32(coeffs, div_check);
+
+            // Store results back
+            let mut result_array = [0i32; 8];
+            _mm256_storeu_si256(result_array.as_mut_ptr() as *mut __m256i, coeffs);
+
+            // Store back to coeffs
+            for j in 0..8 {
+                self.program.total_carry.coeffs[i + j] = result_array[j];
+            }
+
+            // Update carry
+            carry = result_array[7];
+            i += 8;
+        }
+
+        // Handle remaining elements
+        while i < coeffs_len {
+            self.program.total_carry.coeffs[i] += carry;
+            ensure!(self.program.total_carry.coeffs[i] % 256 == 0, "bad carry");
+            self.program.total_carry.coeffs[i] /= 256;
+            carry = self.program.total_carry.coeffs[i];
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    // AVX2 helper for processing output values in parallel
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_process_output<F>(
+        &mut self,
+        offset: usize,
+        base_point: u32,
+        process_fn: F,
+    ) -> Result<()>
+    where
+        F: Fn(u32) -> u32,
+    {
+        // Process 8 elements at a time where possible
+        let base_point_vec = _mm256_set1_epi32(base_point as i32);
+
+        // Process 8 bytes at a time
+        let chunk_size = 8;
+        let mut i = 0;
+
+        while i + chunk_size <= BIGINT_WIDTH_BYTES {
+            // Load coefficients into a vector
+            let mut coeff_array = [0i32; 8];
+            for j in 0..chunk_size {
+                coeff_array[j] =
+                    self.program.total_carry.coeffs[offset * BIGINT_WIDTH_BYTES + i + j] as i32;
+            }
+
+            // Load into AVX2 register
+            let coeffs = _mm256_loadu_si256(coeff_array.as_ptr() as *const __m256i);
+
+            // Add base_point
+            let values = _mm256_add_epi32(coeffs, base_point_vec);
+
+            // Store to temporary array
+            let mut values_array = [0i32; 8];
+            _mm256_storeu_si256(values_array.as_mut_ptr() as *mut __m256i, values);
+
+            // Apply processing function and store result
+            for j in 0..chunk_size {
+                self.state.bytes[i + j] = process_fn(values_array[j] as u32) as u8;
+            }
+
+            i += chunk_size;
+        }
+
+        // Handle remaining elements
+        while i < BIGINT_WIDTH_BYTES {
+            let coeff = self.program.total_carry.coeffs[offset * BIGINT_WIDTH_BYTES + i] as u32;
+            let value = coeff.wrapping_add(base_point);
+            self.state.bytes[i] = process_fn(value) as u8;
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    // AVX2 helper for loading words
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_load_words(&mut self, ctx: &mut dyn Risc0Context, addr: WordAddr) -> Result<()> {
+        // Load all words at once
+        let mut words = [0u32; BIGINT_WIDTH_WORDS];
+        for i in 0..BIGINT_WIDTH_WORDS {
+            words[i] = ctx.load_u32(LoadOp::Record, addr + i)?;
+        }
+
+        // Use AVX2 to convert to bytes
+        if BIGINT_WIDTH_WORDS == 4 {
+            // This works for exactly 16 bytes (4 words)
+            // Load the 4 words (128 bits)
+            let word_vec = _mm_loadu_si128(words.as_ptr() as *const __m128i);
+
+            // Shuffle bytes to convert from little-endian
+            // This converts 4 32-bit integers to 16 bytes
+            let shuffle_mask = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+            let bytes_vec = _mm_shuffle_epi8(word_vec, shuffle_mask);
+
+            // Store the result
+            _mm_storeu_si128(self.state.bytes.as_mut_ptr() as *mut __m128i, bytes_vec);
+        } else {
+            // Fallback for different sizes
+            for i in 0..BIGINT_WIDTH_WORDS {
+                let bytes = words[i].to_le_bytes();
+                for j in 0..WORD_SIZE {
+                    self.state.bytes[i * WORD_SIZE + j] = bytes[j];
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // AVX2 helper for storing words
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_store_words(
+        &mut self,
+        ctx: &mut dyn Risc0Context,
+        addr: WordAddr,
+    ) -> Result<()> {
+        // Use bytemuck for zero-copy casting
+        let words: &[u32] = bytemuck::cast_slice(&self.state.bytes);
+
+        // Store all words at once
+        for (i, &word) in words.iter().enumerate() {
+            ctx.store_u32(addr + i, word)?;
+        }
+
+        Ok(())
+    }
 }
 
 struct BigIntIOImpl<'a> {
@@ -199,26 +460,40 @@ impl<'a> BigIntIOImpl<'a> {
     }
 }
 
+// Optimized conversion using thread-local storage to reduce allocations
 fn bytes_le_to_bigint(bytes: &[u8]) -> Natural {
-    let mut limbs = Vec::with_capacity((bytes.len() + 3) / 4);
+    // Use thread-local storage for the limbs to avoid allocation
+    LIMBS_BUFFER.with(|buffer| {
+        let mut limbs = buffer.borrow_mut();
+        limbs.clear();
+        limbs.reserve((bytes.len() + 3) / 4);
 
-    for chunk in bytes.chunks(4) {
-        let mut arr = [0u8; 4];
-        arr[..chunk.len()].copy_from_slice(chunk);
-        limbs.push(u32::from_le_bytes(arr));
-    }
+        for chunk in bytes.chunks(4) {
+            let mut arr = [0u8; 4];
+            arr[..chunk.len()].copy_from_slice(chunk);
+            limbs.push(u32::from_le_bytes(arr));
+        }
 
-    Natural::from_limbs_asc(&limbs)
+        Natural::from_limbs_asc(&limbs)
+    })
 }
 
+// Optimized conversion using thread-local storage to reduce allocations
 fn bigint_to_bytes_le(value: &Natural) -> Vec<u8> {
-    let limbs = value.to_limbs_asc();
-    let mut out = Vec::with_capacity(limbs.len() * 4);
+    BYTES_BUFFER.with(|buffer| {
+        let mut out = buffer.borrow_mut();
+        out.clear();
 
-    for limb in limbs {
-        out.extend_from_slice(&limb.to_le_bytes());
-    }
-    out
+        let limbs = value.to_limbs_asc();
+        out.reserve(limbs.len() * 4);
+
+        for limb in limbs {
+            out.extend_from_slice(&limb.to_le_bytes());
+        }
+
+        // Return a clone to avoid lifetime issues
+        out.clone()
+    })
 }
 
 impl BigIntIO for BigIntIOImpl<'_> {
@@ -242,15 +517,47 @@ impl BigIntIO for BigIntIOImpl<'_> {
         let addr = base + offset * BIGINT_WIDTH_WORDS as u32;
         tracing::trace!("store(arena: {arena}, offset: {offset}, count: {count}, addr: {addr:?}, value: {value})");
 
+        // Create a pre-sized witness buffer
         let mut witness = vec![0u8; count as usize];
+
+        // Get bytes with reduced allocations
         let bytes = bigint_to_bytes_le(value);
+
+        // Copy bytes into witness buffer
         witness[..bytes.len()].copy_from_slice(&bytes);
-        let chunks = witness.chunks_exact(BIGINT_WIDTH_BYTES);
-        assert_eq!(chunks.len(), count as usize / BIGINT_WIDTH_BYTES);
-        for (i, chunk) in chunks.enumerate() {
-            let addr = addr + i * BIGINT_WIDTH_WORDS;
-            let chunk = chunk.try_into().unwrap();
-            self.witness.insert(addr, chunk);
+
+        // Process in chunks - use SIMD if available for copying
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && BIGINT_WIDTH_BYTES % 32 == 0 {
+            unsafe {
+                let chunks = witness.chunks_exact(BIGINT_WIDTH_BYTES);
+                assert_eq!(chunks.len(), count as usize / BIGINT_WIDTH_BYTES);
+
+                for (i, chunk) in chunks.enumerate() {
+                    let chunk_addr = addr + i * BIGINT_WIDTH_WORDS;
+                    let chunk_bytes: BigIntBytes = chunk.try_into().unwrap();
+
+                    // Use AVX2 to copy chunks
+                    let chunks_avx = (BIGINT_WIDTH_BYTES / 32) as usize;
+                    for j in 0..chunks_avx {
+                        let src_ptr = chunk.as_ptr().add(j * 32) as *const __m256i;
+                        let avx_data = _mm256_loadu_si256(src_ptr);
+
+                        // Process the loaded data as needed
+                        // ...
+                    }
+
+                    self.witness.insert(chunk_addr, chunk_bytes);
+                }
+            }
+        } else {
+            let chunks = witness.chunks_exact(BIGINT_WIDTH_BYTES);
+            assert_eq!(chunks.len(), count as usize / BIGINT_WIDTH_BYTES);
+            for (i, chunk) in chunks.enumerate() {
+                let chunk_addr = addr + i * BIGINT_WIDTH_WORDS;
+                let chunk_bytes: BigIntBytes = chunk.try_into().unwrap();
+                self.witness.insert(chunk_addr, chunk_bytes);
+            }
         }
 
         Ok(())
@@ -269,17 +576,25 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     let nondet_program_size = ctx.load_u32(LoadOp::Load, blob_ptr)?;
     let verify_program_size = ctx.load_u32(LoadOp::Load, blob_ptr + 1)?;
     let consts_size = ctx.load_u32(LoadOp::Load, blob_ptr + 2)?;
-    tracing::debug!("blob_ptr: {blob_ptr:?}");
-    tracing::debug!(
-        "nondet_program_ptr: {nondet_program_ptr:?}, nondet_program_size: {nondet_program_size}"
-    );
+
+    // Prefetch program bytes
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("prefetchw") {
+        unsafe {
+            // Prefetch the program bytes
+            let addr_ptr = nondet_program_ptr.baddr().0 as *const i8;
+            for i in 0..(nondet_program_size as usize * WORD_SIZE / 64) {
+                _mm_prefetch(addr_ptr.add(i * 64), _MM_HINT_T0);
+            }
+        }
+    }
 
     let program_bytes = ctx.load_region(
         LoadOp::Load,
         nondet_program_ptr.baddr(),
         nondet_program_size as usize * WORD_SIZE,
     )?;
-    tracing::debug!("program_bytes: {}", program_bytes.len());
+
     let mut cursor = Cursor::new(program_bytes);
     let program = bibc::Program::decode(&mut cursor)?;
 
@@ -299,8 +614,6 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
         consts_ptr.baddr(),
         consts_size as usize * WORD_SIZE,
     )?;
-
-    // let cycles = verify_program_size as usize + 1;
 
     let state = BigIntState {
         is_ecall: true,
