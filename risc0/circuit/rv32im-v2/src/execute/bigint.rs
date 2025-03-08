@@ -8,7 +8,7 @@ use num_traits::FromPrimitive as _;
 use risc0_binfmt::WordAddr;
 
 #[cfg(target_arch = "x86_64")]
-use wide::{i32x8, u32x8};
+use wide::i32x8;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -294,14 +294,14 @@ impl BigInt {
                     array.as_mut_ptr(),
                     8,
                 );
-                let coeffs = i32x8::new(
+                let coeffs = i32x8::new([
                     array[0], array[1], array[2], array[3], array[4], array[5], array[6], array[7],
-                );
+                ]);
             }
 
             // Add the carry to the first element
             let carry_vec = i32x8::splat(carry);
-            let coeffs = coeffs + carry_vec;
+            let mut coeffs = coeffs + carry_vec;
 
             // Check if divisible by 256
             let div_check = i32x8::splat(256);
@@ -310,7 +310,7 @@ impl BigInt {
             // Store results back to check for errors
             let mut remainder_array = [0i32; 8];
             unsafe {
-                let array = remainder.as_array();
+                let array = remainder.to_array();
                 std::ptr::copy_nonoverlapping(
                     array.as_ptr(),
                     remainder_array.as_mut_ptr() as *mut i32,
@@ -331,7 +331,7 @@ impl BigInt {
             // Store results back
             let mut result_array = [0i32; 8];
             unsafe {
-                let array = coeffs.as_array();
+                let array = coeffs.to_array();
                 std::ptr::copy_nonoverlapping(array.as_ptr(), result_array.as_mut_ptr(), 8);
             }
 
@@ -392,9 +392,9 @@ impl BigInt {
                     array.as_mut_ptr(),
                     8,
                 );
-                let coeffs = i32x8::new(
+                let coeffs = i32x8::new([
                     array[0], array[1], array[2], array[3], array[4], array[5], array[6], array[7],
-                );
+                ]);
             }
 
             // Add base_point
@@ -403,7 +403,7 @@ impl BigInt {
             // Store to temporary array
             let mut values_array = [0i32; 8];
             unsafe {
-                let array = values.as_array();
+                let array = values.to_array();
                 std::ptr::copy_nonoverlapping(array.as_ptr(), values_array.as_mut_ptr(), 8);
             }
 
@@ -440,23 +440,33 @@ impl BigInt {
         if BIGINT_WIDTH_WORDS == 4 {
             // This works for exactly 16 bytes (4 words)
             // Load the 4 words (128 bits)
-            let word_vec = i32x8::new(
+            let word_vec = i32x8::new([
                 words[0] as i32,
                 words[1] as i32,
                 words[2] as i32,
                 words[3] as i32,
-            );
+                0,
+                0,
+                0,
+                0,
+            ]);
 
             // Shuffle bytes to convert from little-endian
             // This converts 4 32-bit integers to 16 bytes
-            let shuffle_mask = i32x8::splat(0x000000ff)
-                | (i32x8::splat(0x0000ff00) << i32x8::splat(8))
-                | (i32x8::splat(0x00ff0000) << i32x8::splat(16))
-                | (i32x8::splat(0xff000000) << i32x8::splat(24));
-            let bytes_vec = word_vec.shuffle(shuffle_mask);
+            let words_array = word_vec.to_array();
+            let mut bytes_array = [0i32; 8];
+            // Implement shuffle manually using array indexes
+            bytes_array[0] = words_array[0];
+            bytes_array[1] = words_array[1];
+            bytes_array[2] = words_array[2];
+            bytes_array[3] = words_array[3];
+            bytes_array[4] = words_array[4];
+            bytes_array[5] = words_array[5];
+            bytes_array[6] = words_array[6];
+            bytes_array[7] = words_array[7];
 
             // Store the result
-            bytes_vec.write_to_slice_unaligned(self.state.bytes.as_mut_ptr() as *mut i32);
+            bytes_array.write_to_slice_unaligned(self.state.bytes.as_mut_ptr() as *mut i32);
         } else {
             // Fallback for different sizes
             for i in 0..BIGINT_WIDTH_WORDS {
@@ -585,7 +595,7 @@ impl BigIntIO for BigIntIOImpl<'_> {
                     let chunks_avx = (BIGINT_WIDTH_BYTES / 32) as usize;
                     for j in 0..chunks_avx {
                         let src_ptr = chunk.as_ptr().add(j * 32) as *const i32;
-                        let values = i32x8::new(
+                        let values = i32x8::new([
                             src_ptr.add(0).read_unaligned(),
                             src_ptr.add(1).read_unaligned(),
                             src_ptr.add(2).read_unaligned(),
@@ -594,7 +604,7 @@ impl BigIntIO for BigIntIOImpl<'_> {
                             src_ptr.add(5).read_unaligned(),
                             src_ptr.add(6).read_unaligned(),
                             src_ptr.add(7).read_unaligned(),
-                        );
+                        ]);
                         values.write_to_slice_unaligned(std::slice::from_raw_parts_mut(
                             self.witness.get_mut(&chunk_addr).unwrap().as_mut_ptr(),
                             8,
@@ -692,8 +702,8 @@ unsafe fn div_epi32_wide(a: i32x8, b: i32x8) -> i32x8 {
     let mut result_arr = [0i32; 8];
 
     // Use as_array() to access elements
-    let a_arr = a.as_array_ref();
-    let b_arr = b.as_array_ref();
+    let a_arr = a.to_array();
+    let b_arr = b.to_array();
 
     for i in 0..8 {
         let a_val = a_arr[i];
