@@ -297,7 +297,7 @@ impl BigInt {
                 coeff_array[6],
                 coeff_array[7],
             ]);
-            let mut coeffs = coeffs_inner + i32x8::splat(carry);
+            let coeffs = coeffs_inner + i32x8::splat(carry);
 
             // Check if divisible by 256
             let div_check = i32x8::splat(256);
@@ -391,7 +391,7 @@ impl BigInt {
                 coeff_array[6],
                 coeff_array[7],
             ]);
-            let mut coeffs = coeffs_inner + base_point_vec;
+            let coeffs = coeffs_inner + base_point_vec;
 
             // Add base_point
             let values = coeffs;
@@ -605,13 +605,12 @@ impl BigIntIO for BigIntIOImpl<'_> {
                         ]);
                         let values_array = values.to_array();
                         let dst_ptr = self.witness.get_mut(&chunk_addr).unwrap().as_mut_ptr();
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                values_array.as_ptr(),
-                                dst_ptr.add(j * 8) as *mut i32,
-                                8,
-                            );
-                        }
+
+                        std::ptr::copy_nonoverlapping(
+                            values_array.as_ptr(),
+                            dst_ptr.add(j * 8) as *mut i32,
+                            8,
+                        );
                     }
 
                     self.witness.insert(chunk_addr, chunk_bytes);
