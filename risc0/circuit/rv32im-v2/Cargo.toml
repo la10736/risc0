@@ -30,6 +30,7 @@ serde = { version = "1.0", default-features = false, features = [
 tracing = { version = "0.1", default-features = false, features = [
   "attributes",
 ] }
+wide = "0.7.32"
 
 [target.'cfg(not(target_os = "zkvm"))'.dependencies]
 auto_ops = { version = "0.3", optional = true }

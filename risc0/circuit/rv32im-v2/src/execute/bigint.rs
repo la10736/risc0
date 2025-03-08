@@ -6,6 +6,7 @@ use malachite::Natural;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive as _;
 use risc0_binfmt::WordAddr;
+use wide::{i32x8, u32x8};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -284,19 +285,19 @@ impl BigInt {
             }
 
             // Set up the vector
-            let mut coeffs = _mm256_loadu_si256(coeff_array.as_ptr() as *const __m256i);
+            let mut coeffs = i32x8::from_slice_unaligned(coeff_array.as_ptr() as *const i32);
 
             // Add the carry to the first element
-            let carry_vec = _mm256_set_epi32(0, 0, 0, 0, 0, 0, 0, carry);
-            coeffs = _mm256_add_epi32(coeffs, carry_vec);
+            let carry_vec = i32x8::splat(carry);
+            coeffs = coeffs + carry_vec;
 
             // Check if divisible by 256
-            let div_check = _mm256_set1_epi32(256);
-            let remainder = _mm256_rem_epi32(coeffs, div_check);
+            let div_check = i32x8::splat(256);
+            let remainder = rem_epi32_wide(coeffs, div_check);
 
             // Store results back to check for errors
             let mut remainder_array = [0i32; 8];
-            _mm256_storeu_si256(remainder_array.as_mut_ptr() as *mut __m256i, remainder);
+            remainder.write_to_slice_unaligned(remainder_array.as_mut_ptr() as *mut i32);
 
             // Check remainders - if not divisible by 256, error out
             for rem in &remainder_array {
@@ -306,11 +307,11 @@ impl BigInt {
             }
 
             // Divide by 256
-            coeffs = _mm256_div_epi32(coeffs, div_check);
+            coeffs = div_epi32_wide(coeffs, div_check);
 
             // Store results back
             let mut result_array = [0i32; 8];
-            _mm256_storeu_si256(result_array.as_mut_ptr() as *mut __m256i, coeffs);
+            coeffs.write_to_slice_unaligned(result_array.as_mut_ptr() as *mut i32);
 
             // Store back to coeffs
             for j in 0..8 {
@@ -347,7 +348,7 @@ impl BigInt {
         F: Fn(u32) -> u32,
     {
         // Process 8 elements at a time where possible
-        let base_point_vec = _mm256_set1_epi32(base_point as i32);
+        let base_point_vec = i32x8::splat(base_point as i32);
 
         // Process 8 bytes at a time
         let chunk_size = 8;
@@ -362,14 +363,14 @@ impl BigInt {
             }
 
             // Load into AVX2 register
-            let coeffs = _mm256_loadu_si256(coeff_array.as_ptr() as *const __m256i);
+            let coeffs = i32x8::from_slice_unaligned(coeff_array.as_ptr() as *const i32);
 
             // Add base_point
-            let values = _mm256_add_epi32(coeffs, base_point_vec);
+            let values = coeffs + base_point_vec;
 
             // Store to temporary array
             let mut values_array = [0i32; 8];
-            _mm256_storeu_si256(values_array.as_mut_ptr() as *mut __m256i, values);
+            values.write_to_slice_unaligned(values_array.as_mut_ptr() as *mut i32);
 
             // Apply processing function and store result
             for j in 0..chunk_size {
@@ -404,15 +405,18 @@ impl BigInt {
         if BIGINT_WIDTH_WORDS == 4 {
             // This works for exactly 16 bytes (4 words)
             // Load the 4 words (128 bits)
-            let word_vec = _mm_loadu_si128(words.as_ptr() as *const __m128i);
+            let word_vec = i32x8::from_slice_unaligned(words.as_ptr() as *const i32);
 
             // Shuffle bytes to convert from little-endian
             // This converts 4 32-bit integers to 16 bytes
-            let shuffle_mask = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
-            let bytes_vec = _mm_shuffle_epi8(word_vec, shuffle_mask);
+            let shuffle_mask = i32x8::splat(0x000000ff)
+                | (i32x8::splat(0x0000ff00) << i32x8::splat(8))
+                | (i32x8::splat(0x00ff0000) << i32x8::splat(16))
+                | (i32x8::splat(0xff000000) << i32x8::splat(24));
+            let bytes_vec = word_vec.shuffle(shuffle_mask);
 
             // Store the result
-            _mm_storeu_si128(self.state.bytes.as_mut_ptr() as *mut __m128i, bytes_vec);
+            bytes_vec.write_to_slice_unaligned(self.state.bytes.as_mut_ptr() as *mut i32);
         } else {
             // Fallback for different sizes
             for i in 0..BIGINT_WIDTH_WORDS {
@@ -540,11 +544,13 @@ impl BigIntIO for BigIntIOImpl<'_> {
                     // Use AVX2 to copy chunks
                     let chunks_avx = (BIGINT_WIDTH_BYTES / 32) as usize;
                     for j in 0..chunks_avx {
-                        let src_ptr = chunk.as_ptr().add(j * 32) as *const __m256i;
-                        let avx_data = _mm256_loadu_si256(src_ptr);
-
-                        // Process the loaded data as needed
-                        // ...
+                        let src_ptr = chunk.as_ptr().add(j * 32) as *const i32;
+                        let values =
+                            i32x8::from_slice_unaligned(std::slice::from_raw_parts(src_ptr, 8));
+                        values.write_to_slice_unaligned(std::slice::from_raw_parts_mut(
+                            self.witness.get_mut(&chunk_addr).unwrap().as_mut_ptr(),
+                            8,
+                        ));
                     }
 
                     self.witness.insert(chunk_addr, chunk_bytes);
@@ -579,7 +585,7 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
 
     // Prefetch program bytes
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("prefetchw") {
+    if is_x86_feature_detected!("avx2") {
         unsafe {
             // Prefetch the program bytes
             let addr_ptr = nondet_program_ptr.baddr().0 as *const i8;
@@ -630,4 +636,57 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     };
 
     bigint.run(ctx, &witness)
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+unsafe fn div_epi32_wide(a: i32x8, b: i32x8) -> i32x8 {
+    let mut result_arr = [0i32; 8];
+
+    // Use as_array() to access elements
+    let a_arr = a.as_array_ref();
+    let b_arr = b.as_array_ref();
+
+    for i in 0..8 {
+        let a_val = a_arr[i];
+        let b_val = b_arr[i];
+        result_arr[i] = if b_val != 0 { a_val / b_val } else { 0 };
+    }
+
+    i32x8::new([
+        result_arr[0],
+        result_arr[1],
+        result_arr[2],
+        result_arr[3],
+        result_arr[4],
+        result_arr[5],
+        result_arr[6],
+        result_arr[7],
+    ])
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+unsafe fn rem_epi32_wide(a: i32x8, b: i32x8) -> i32x8 {
+    let mut result_arr = a.to_array();
+    let b_arr = b.to_array();
+
+    for i in 0..8 {
+        result_arr[i] = if b_arr[i] != 0 {
+            result_arr[i] % b_arr[i]
+        } else {
+            result_arr[i]
+        };
+    }
+
+    i32x8::new([
+        result_arr[0],
+        result_arr[1],
+        result_arr[2],
+        result_arr[3],
+        result_arr[4],
+        result_arr[5],
+        result_arr[6],
+        result_arr[7],
+    ])
 }
