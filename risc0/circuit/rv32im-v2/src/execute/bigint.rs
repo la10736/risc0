@@ -331,6 +331,7 @@ fn propagate_carry_simd(total_carry: &mut [i32]) -> Result<()> {
 
         // Check remainder
         let remainder = i32x8::new(remainder_array);
+        tracing::debug!("remainder: {remainder:?}");
         ensure!(remainder == i32x8::splat(0), "bad carry");
 
         // Create new vector and save as carry
@@ -344,6 +345,7 @@ fn propagate_carry_simd(total_carry: &mut [i32]) -> Result<()> {
     let mut scalar_carry = carry.to_array()[7];
     for coeff in total_carry.chunks_exact_mut(8).into_remainder() {
         *coeff += scalar_carry;
+        tracing::debug!("coeff: {coeff:?}");
         ensure!(*coeff % 256 == 0, "bad carry");
         *coeff /= 256;
         scalar_carry = *coeff;
