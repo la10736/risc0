@@ -187,7 +187,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             let partial_images_thread =
                 scope.spawn(move || compute_partial_images(commit_recv, callback));
             while self.terminate_state.is_none() {
-                if self.phys_cycles & 0x10 == 0 && self.segment_cycles() >= segment_threshold {
+                if self.segment_cycles() >= segment_threshold {
                     tracing::debug!(
                         "split(phys: {} + pager: {} + reserved: {LOOKUP_TABLE_CYCLES}) = {} >= {segment_threshold}",
                         self.phys_cycles,
