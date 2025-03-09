@@ -19,7 +19,7 @@ use anyhow::{ensure, Result};
 use auto_ops::impl_op_ex;
 use risc0_zkp::field::Elem as _;
 use smallvec::{smallvec, SmallVec};
-use wide::i32x8;
+use wide::{i32x4, i32x8};
 
 use super::bigint::{BigIntState, Instruction, PolyOp, BIGINT_WIDTH_BYTES};
 
@@ -151,7 +151,9 @@ fn byte_poly_add(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
     if !rhs.coeffs.is_empty() {
         // Use SIMD for the common part
         if rhs.coeffs.len() >= 8 {
-            _add_polynomials_simd(&mut ret[..rhs.coeffs.len()], &rhs.coeffs).unwrap();
+            add_polynomials_simd_8(&mut ret[..rhs.coeffs.len()], &rhs.coeffs).unwrap();
+        } else if rhs.coeffs.len() >= 4 {
+            add_polynomials_simd_4(&mut ret[..rhs.coeffs.len()], &rhs.coeffs).unwrap();
         } else {
             // For very small polynomials, just use normal addition
             for (i, &coeff) in rhs.coeffs.iter().enumerate() {
@@ -279,7 +281,8 @@ impl BigIntAccum {
     }
 }
 
-fn _add_polynomials_simd(dest: &mut [i32], src: &[i32]) -> Result<()> {
+fn add_polynomials_simd_8(dest: &mut [i32], src: &[i32]) -> Result<()> {
+    tracing::info!("add_polynomials_simd_8");
     for chunk in 0..(dest.len() / 8) {
         let start = chunk * 8;
 
@@ -316,6 +319,38 @@ fn _add_polynomials_simd(dest: &mut [i32], src: &[i32]) -> Result<()> {
 
     // Handle remaining elements
     let remaining_start = (dest.len() / 8) * 8;
+    for i in remaining_start..dest.len() {
+        dest[i] += src[i];
+    }
+
+    Ok(())
+}
+
+fn add_polynomials_simd_4(dest: &mut [i32], src: &[i32]) -> Result<()> {
+    tracing::info!("add_polynomials_simd_4");
+    for chunk in 0..(dest.len() / 8) {
+        let start = chunk * 8;
+
+        // Load 8 elements at once
+        let dest_vec = i32x4::new([
+            dest[start],
+            dest[start + 1],
+            dest[start + 2],
+            dest[start + 3],
+        ]);
+
+        let src_vec = i32x4::new([src[start], src[start + 1], src[start + 2], src[start + 3]]);
+
+        // SIMD addition
+        let result = dest_vec + src_vec;
+
+        // Store result
+        let result_array = result.to_array();
+        dest[start..start + 8].copy_from_slice(&result_array);
+    }
+
+    // Handle remaining elements
+    let remaining_start = (dest.len() / 4) * 4;
     for i in remaining_start..dest.len() {
         dest[i] += src[i];
     }
