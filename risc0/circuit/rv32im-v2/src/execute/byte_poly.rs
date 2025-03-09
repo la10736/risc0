@@ -139,15 +139,24 @@ impl BytePolynomial {
 }
 
 fn byte_poly_add(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
-    let mut ret = smallvec![0; max(lhs.coeffs.len(), rhs.coeffs.len())];
-    for (i, coeff) in ret.iter_mut().enumerate() {
-        if i < lhs.coeffs.len() {
-            *coeff += lhs.coeffs[i];
-        }
-        if i < rhs.coeffs.len() {
-            *coeff += rhs.coeffs[i];
+    let max_len = max(lhs.coeffs.len(), rhs.coeffs.len());
+    let mut ret = smallvec![0; max_len];
+
+    // Then use SIMD to add the second polynomial to the result
+    if !rhs.coeffs.is_empty() {
+        // Copy coefficients to the result vector first
+        ret[..rhs.coeffs.len()].copy_from_slice(&rhs.coeffs);
+        // Use SIMD for the common part
+        if rhs.coeffs.len() >= 8 {
+            _add_polynomials_simd(&mut ret[..rhs.coeffs.len()], &rhs.coeffs).unwrap();
+        } else {
+            // For very small polynomials, just use normal addition
+            for (i, &coeff) in rhs.coeffs.iter().enumerate() {
+                ret[i] += coeff;
+            }
         }
     }
+
     BytePolynomial { coeffs: ret }
 }
 
