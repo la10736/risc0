@@ -282,7 +282,6 @@ impl BigIntAccum {
 }
 
 fn add_polynomials_simd_8(dest: &mut [i32], src: &[i32]) -> Result<()> {
-    tracing::info!("add_polynomials_simd_8");
     for chunk in 0..(dest.len() / 8) {
         let start = chunk * 8;
 
@@ -327,7 +326,6 @@ fn add_polynomials_simd_8(dest: &mut [i32], src: &[i32]) -> Result<()> {
 }
 
 fn add_polynomials_simd_4(dest: &mut [i32], src: &[i32]) -> Result<()> {
-    tracing::info!("add_polynomials_simd_4");
     for chunk in 0..(dest.len() / 8) {
         let start = chunk * 8;
 
