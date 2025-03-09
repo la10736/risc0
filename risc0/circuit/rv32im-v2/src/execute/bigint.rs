@@ -128,7 +128,9 @@ impl BigInt {
 
                 // Do carry propagation
                 for coeff in self.program.total_carry.coeffs.iter_mut() {
+                    tracing::trace!("carry: {carry}");
                     *coeff += carry;
+                    tracing::trace!("coeff: {coeff}");
                     ensure!(*coeff % 256 == 0, "bad carry");
                     *coeff /= 256;
                     carry = *coeff;
