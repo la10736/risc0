@@ -142,10 +142,13 @@ fn byte_poly_add(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
     let max_len = max(lhs.coeffs.len(), rhs.coeffs.len());
     let mut ret = smallvec![0; max_len];
 
+    // Copy lhs coefficients to the result vector first
+    if !lhs.coeffs.is_empty() {
+        ret[..lhs.coeffs.len()].copy_from_slice(&lhs.coeffs);
+    }
+
     // Then use SIMD to add the second polynomial to the result
     if !rhs.coeffs.is_empty() {
-        // Copy coefficients to the result vector first
-        ret[..rhs.coeffs.len()].copy_from_slice(&rhs.coeffs);
         // Use SIMD for the common part
         if rhs.coeffs.len() >= 8 {
             _add_polynomials_simd(&mut ret[..rhs.coeffs.len()], &rhs.coeffs).unwrap();
