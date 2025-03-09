@@ -14,15 +14,14 @@
 
 use std::cmp::max;
 
+use crate::zirgen::circuit::ExtVal;
 use anyhow::{ensure, Result};
 use auto_ops::impl_op_ex;
 use risc0_zkp::field::Elem as _;
 use smallvec::{smallvec, SmallVec};
-
-use crate::zirgen::circuit::ExtVal;
+use wide::i32x8;
 
 use super::bigint::{BigIntState, Instruction, PolyOp, BIGINT_WIDTH_BYTES};
-use wide::i32x8;
 
 #[derive(Debug)]
 pub(crate) struct BytePolyProgram {
@@ -63,7 +62,7 @@ impl BytePolyProgram {
                 self.term = new_poly.clone();
             }
             PolyOp::AddTotal => {
-                add_polynomials_simd(&mut self.total.coeffs, &self.term.coeffs)?;
+                self.total = &self.total + &new_poly * &self.term * insn.coeff;
                 self.term = BytePolynomial::one();
                 self.poly = BytePolynomial::zero();
             }
@@ -71,7 +70,7 @@ impl BytePolyProgram {
                 let neg_poly = BytePolynomial {
                     coeffs: SmallVec::from_elem(-128, BIGINT_WIDTH_BYTES),
                 };
-                self.poly = &self.poly + (&delta_poly + neg_poly) * 64 * 256;
+                self.poly = &self.poly + (&delta_poly + neg_poly) * 0x4000;
             }
             PolyOp::Carry2 => {
                 self.poly = &self.poly + &delta_poly * 256;
@@ -249,11 +248,11 @@ impl BigIntAccum {
                 self.state.term = ExtVal::ONE;
             }
             PolyOp::Carry1 => {
-                self.state.poly += (delta_poly - self.neg_poly) * ExtVal::from_u32(64 * 256);
+                self.state.poly += (delta_poly - self.neg_poly) * ExtVal::from_u32(0x4000);
             }
-            PolyOp::Carry2 => self.state.poly += delta_poly * ExtVal::from_u32(256),
+            PolyOp::Carry2 => self.state.poly += delta_poly * ExtVal::from_u32(0x100),
             PolyOp::EqZero => {
-                let carry = self.powers[1] - ExtVal::from_u32(256);
+                let carry = self.powers[1] - ExtVal::from_u32(0x100);
                 let goal = self.state.total + new_poly * carry;
                 ensure!(goal == ExtVal::ZERO, "Invalid eqz in bigint accum");
                 self.reset();
@@ -268,7 +267,7 @@ impl BigIntAccum {
     }
 }
 
-fn add_polynomials_simd(dest: &mut [i32], src: &[i32]) -> Result<()> {
+fn _add_polynomials_simd(dest: &mut [i32], src: &[i32]) -> Result<()> {
     for chunk in 0..(dest.len() / 8) {
         let start = chunk * 8;
 
