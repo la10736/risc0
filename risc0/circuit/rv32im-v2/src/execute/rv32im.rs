@@ -14,7 +14,6 @@
 
 use anyhow::Result;
 use derive_more::Debug;
-use ringbuffer::{AllocRingBuffer, RingBuffer};
 use risc0_binfmt::{ByteAddr, WordAddr};
 
 use super::platform::{REG_MAX, REG_ZERO, WORD_SIZE};
@@ -67,7 +66,6 @@ pub trait EmuContext {
 // #[derive(Default)]
 pub struct Emulator {
     table: FastDecodeTable,
-    ring: AllocRingBuffer<(ByteAddr, Instruction, DecodedInstruction)>,
 }
 
 #[derive(Debug)]
@@ -368,25 +366,185 @@ impl FastDecodeTable {
     }
 }
 
+#[allow(dead_code)]
+trait ResultExt<E> {
+    fn none_or_kind(self, kind: InsnKind) -> Result<Option<InsnKind>, E>;
+}
+
+impl<E> ResultExt<E> for Result<bool, E> {
+    fn none_or_kind(self, kind: InsnKind) -> Result<Option<InsnKind>, E> {
+        self.map(|b| if b { None } else { Some(kind) })
+    }
+}
+
 impl Emulator {
     pub fn new() -> Self {
         Self {
             table: FastDecodeTable::new(),
-            ring: AllocRingBuffer::new(10),
         }
     }
 
+    #[inline(always)]
     #[allow(dead_code)]
-    pub fn dump(&self) {
-        tracing::debug!("Dumping last {} instructions:", self.ring.len());
-        for (pc, insn, decoded) in self.ring.iter() {
-            tracing::debug!("{pc:?}> {:#010x}  {}", decoded.insn, disasm(insn, decoded));
-        }
-    }
+    fn exec_rv32im<C: EmuContext>(&mut self, ctx: &mut C, word: u32) -> Result<Option<InsnKind>> {
+        let decoded = DecodedInstruction::new(word);
 
-    #[allow(dead_code)]
-    fn ring_push(&mut self, pc: ByteAddr, insn: Instruction, decoded: DecodedInstruction) {
-        self.ring.push((pc, insn, decoded));
+        match (decoded.opcode, decoded.func3, decoded.func7) {
+            // R-format arithmetic ops
+            (0b0110011, 0b000, 0b0000000) => self
+                .step_compute(ctx, InsnKind::Add, &decoded)
+                .none_or_kind(InsnKind::Add),
+            (0b0110011, 0b000, 0b0100000) => self
+                .step_compute(ctx, InsnKind::Sub, &decoded)
+                .none_or_kind(InsnKind::Sub),
+            (0b0110011, 0b001, 0b0000000) => self
+                .step_compute(ctx, InsnKind::Sll, &decoded)
+                .none_or_kind(InsnKind::Sll),
+            (0b0110011, 0b010, 0b0000000) => self
+                .step_compute(ctx, InsnKind::Slt, &decoded)
+                .none_or_kind(InsnKind::Slt),
+            (0b0110011, 0b011, 0b0000000) => self
+                .step_compute(ctx, InsnKind::SltU, &decoded)
+                .none_or_kind(InsnKind::SltU),
+            (0b0110011, 0b101, 0b0000000) => self
+                .step_compute(ctx, InsnKind::Srl, &decoded)
+                .none_or_kind(InsnKind::Srl),
+            (0b0110011, 0b100, 0b0000000) => self
+                .step_compute(ctx, InsnKind::Xor, &decoded)
+                .none_or_kind(InsnKind::Xor),
+            (0b0110011, 0b101, 0b0100000) => self
+                .step_compute(ctx, InsnKind::Sra, &decoded)
+                .none_or_kind(InsnKind::Sra),
+            (0b0110011, 0b110, 0b0000000) => self
+                .step_compute(ctx, InsnKind::Or, &decoded)
+                .none_or_kind(InsnKind::Or),
+            (0b0110011, 0b111, 0b0000000) => self
+                .step_compute(ctx, InsnKind::And, &decoded)
+                .none_or_kind(InsnKind::And),
+            (0b0110011, 0b000, 0b0000001) => self
+                .step_compute(ctx, InsnKind::Mul, &decoded)
+                .none_or_kind(InsnKind::Mul),
+            (0b0110011, 0b001, 0b0000001) => self
+                .step_compute(ctx, InsnKind::MulH, &decoded)
+                .none_or_kind(InsnKind::MulH),
+            (0b0110011, 0b010, 0b0000001) => self
+                .step_compute(ctx, InsnKind::MulHSU, &decoded)
+                .none_or_kind(InsnKind::MulHSU),
+            (0b0110011, 0b011, 0b0000001) => self
+                .step_compute(ctx, InsnKind::MulHU, &decoded)
+                .none_or_kind(InsnKind::MulHU),
+            (0b0110011, 0b100, 0b0000001) => self
+                .step_compute(ctx, InsnKind::Div, &decoded)
+                .none_or_kind(InsnKind::Div),
+            (0b0110011, 0b101, 0b0000001) => self
+                .step_compute(ctx, InsnKind::DivU, &decoded)
+                .none_or_kind(InsnKind::DivU),
+            (0b0110011, 0b110, 0b0000001) => self
+                .step_compute(ctx, InsnKind::Rem, &decoded)
+                .none_or_kind(InsnKind::Rem),
+            (0b0110011, 0b111, 0b0000001) => self
+                .step_compute(ctx, InsnKind::RemU, &decoded)
+                .none_or_kind(InsnKind::RemU),
+            // I-format arithmetic ops
+            (0b0010011, 0b000, _) => self
+                .step_compute(ctx, InsnKind::AddI, &decoded)
+                .none_or_kind(InsnKind::AddI),
+            (0b0010011, 0b001, 0b0000000) => self
+                .step_compute(ctx, InsnKind::SllI, &decoded)
+                .none_or_kind(InsnKind::SllI),
+            (0b0010011, 0b010, _) => self
+                .step_compute(ctx, InsnKind::SltI, &decoded)
+                .none_or_kind(InsnKind::SltI),
+            (0b0010011, 0b011, _) => self
+                .step_compute(ctx, InsnKind::SltIU, &decoded)
+                .none_or_kind(InsnKind::SltIU),
+            (0b0010011, 0b100, _) => self
+                .step_compute(ctx, InsnKind::XorI, &decoded)
+                .none_or_kind(InsnKind::XorI),
+            (0b0010011, 0b101, 0b0000000) => self
+                .step_compute(ctx, InsnKind::SrlI, &decoded)
+                .none_or_kind(InsnKind::SrlI),
+            (0b0010011, 0b101, 0b0100000) => self
+                .step_compute(ctx, InsnKind::SraI, &decoded)
+                .none_or_kind(InsnKind::SraI),
+            (0b0010011, 0b110, _) => self
+                .step_compute(ctx, InsnKind::OrI, &decoded)
+                .none_or_kind(InsnKind::OrI),
+            (0b0010011, 0b111, _) => self
+                .step_compute(ctx, InsnKind::AndI, &decoded)
+                .none_or_kind(InsnKind::AndI),
+            // I-format memory loads
+            (0b0000011, 0b000, _) => self
+                .step_load(ctx, InsnKind::Lb, &decoded)
+                .none_or_kind(InsnKind::Lb),
+            (0b0000011, 0b001, _) => self
+                .step_load(ctx, InsnKind::Lh, &decoded)
+                .none_or_kind(InsnKind::Lh),
+            (0b0000011, 0b010, _) => self
+                .step_load(ctx, InsnKind::Lw, &decoded)
+                .none_or_kind(InsnKind::Lw),
+            (0b0000011, 0b100, _) => self
+                .step_load(ctx, InsnKind::LbU, &decoded)
+                .none_or_kind(InsnKind::LbU),
+            (0b0000011, 0b101, _) => self
+                .step_load(ctx, InsnKind::LhU, &decoded)
+                .none_or_kind(InsnKind::LhU),
+            // S-format memory stores
+            (0b0100011, 0b000, _) => self
+                .step_store(ctx, InsnKind::Sb, &decoded)
+                .none_or_kind(InsnKind::Sb),
+            (0b0100011, 0b001, _) => self
+                .step_store(ctx, InsnKind::Sh, &decoded)
+                .none_or_kind(InsnKind::Sh),
+            (0b0100011, 0b010, _) => self
+                .step_store(ctx, InsnKind::Sw, &decoded)
+                .none_or_kind(InsnKind::Sw),
+            // U-format lui
+            (0b0110111, _, _) => self
+                .step_compute(ctx, InsnKind::Lui, &decoded)
+                .none_or_kind(InsnKind::Lui),
+            // U-format auipc
+            (0b0010111, _, _) => self
+                .step_compute(ctx, InsnKind::Auipc, &decoded)
+                .none_or_kind(InsnKind::Auipc),
+            // B-format branch
+            (0b1100011, 0b000, _) => self
+                .step_compute(ctx, InsnKind::Beq, &decoded)
+                .none_or_kind(InsnKind::Beq),
+            (0b1100011, 0b001, _) => self
+                .step_compute(ctx, InsnKind::Bne, &decoded)
+                .none_or_kind(InsnKind::Bne),
+            (0b1100011, 0b100, _) => self
+                .step_compute(ctx, InsnKind::Blt, &decoded)
+                .none_or_kind(InsnKind::Blt),
+            (0b1100011, 0b101, _) => self
+                .step_compute(ctx, InsnKind::Bge, &decoded)
+                .none_or_kind(InsnKind::Bge),
+            (0b1100011, 0b110, _) => self
+                .step_compute(ctx, InsnKind::BltU, &decoded)
+                .none_or_kind(InsnKind::BltU),
+            (0b1100011, 0b111, _) => self
+                .step_compute(ctx, InsnKind::BgeU, &decoded)
+                .none_or_kind(InsnKind::Bge),
+            // J-format jal
+            (0b1101111, _, _) => self
+                .step_compute(ctx, InsnKind::Jal, &decoded)
+                .none_or_kind(InsnKind::Jal),
+            // I-format jalr
+            (0b1100111, _, _) => self
+                .step_compute(ctx, InsnKind::JalR, &decoded)
+                .none_or_kind(InsnKind::JalR),
+            // System instruction
+            (0b1110011, 0b000, 0b0011000) => self
+                .step_system(ctx, InsnKind::Mret, &decoded)
+                .none_or_kind(InsnKind::Mret),
+            (0b1110011, 0b000, 0b0000000) => self
+                .step_system(ctx, InsnKind::Eany, &decoded)
+                .none_or_kind(InsnKind::Eany),
+            _ => ctx
+                .trap(Exception::IllegalInstruction(decoded.insn, line!()))
+                .none_or_kind(InsnKind::Invalid),
+        }
     }
 
     #[inline(always)]
@@ -397,18 +555,15 @@ impl Emulator {
         let insn = self.table.lookup(&decoded);
         ctx.on_insn_decoded(&insn, &decoded)?;
 
-        let category_index = insn.category as usize;
-        let result = match category_index {
-            0 => self.step_compute(ctx, insn.kind, &decoded)?,
-            1 => self.step_load(ctx, insn.kind, &decoded)?,
-            2 => self.step_store(ctx, insn.kind, &decoded)?,
-            3 => self.step_system(ctx, insn.kind, &decoded)?,
-            _ => ctx.trap(Exception::IllegalInstruction(word, 1))?,
-        };
+        // Use exec_rv32im instead of category-based dispatch
+        let kind_opt = self.exec_rv32im(ctx, word)?;
 
-        if result {
+        // If kind_opt is None, it means normal execution occurred and PC was incremented
+        // If kind_opt is Some, it means a branch/jump happened and PC was already updated
+        if kind_opt.is_none() {
             ctx.on_normal_end(&insn, &decoded)?;
         }
+
         Ok(())
     }
 
@@ -640,7 +795,7 @@ impl Emulator {
                 _ => ctx.trap(Exception::IllegalInstruction(decoded.insn, 2)),
             },
             InsnKind::Mret => ctx.mret(),
-            _ => unreachable!(),
+            _ => unreachable!("Only system instructions should be passed to step_system"),
         }
     }
 }
