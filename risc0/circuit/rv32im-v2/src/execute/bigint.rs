@@ -119,21 +119,23 @@ impl BigInt {
             ctx.load_aligned_addr_from_machine_register(LoadOp::Record, insn.reg as usize)?;
         let addr = base + insn.offset * BIGINT_WIDTH_WORDS as u32;
 
-        tracing::trace!("step({:?}, {insn:?}, {addr:?})", self.state.pc);
         if insn.mem_op == MemoryOp::Check && insn.poly_op != PolyOp::Reset {
             if !self.program.in_carry {
                 self.program.in_carry = true;
                 self.program.total_carry = self.program.total.clone();
-                let mut carry = 0;
 
-                // Do carry propagation
-                for coeff in self.program.total_carry.coeffs.iter_mut() {
-                    *coeff += carry;
-                    ensure!(*coeff % 256 == 0, "bad carry");
-                    *coeff /= 256;
+                let mut carry = 0;
+                let coeffs = &mut self.program.total_carry.coeffs;
+
+                // Straight-line carry propagation
+                // Optimized to remove branching for better performance
+                for coeff in coeffs.iter_mut() {
+                    let val = *coeff + carry;
+                    // Check divisibility and perform division in one step
+                    ensure!(val % 256 == 0, "bad carry");
+                    *coeff = val / 256;
                     carry = *coeff;
                 }
-                tracing::trace!("carry propagate complete");
             }
 
             let base_point = 0x200000;
@@ -151,12 +153,15 @@ impl BigInt {
                 }
             }
         } else if insn.mem_op == MemoryOp::Read {
+            let mut bytes = [0u8; BIGINT_WIDTH_BYTES];
             for i in 0..BIGINT_WIDTH_WORDS {
                 let word = ctx.load_u32(LoadOp::Record, addr + i)?;
-                for (j, byte) in word.to_le_bytes().iter().enumerate() {
-                    self.state.bytes[i * WORD_SIZE + j] = *byte;
-                }
+                let word_bytes = word.to_le_bytes();
+                let start = i * WORD_SIZE;
+                let end = start + WORD_SIZE;
+                bytes[start..end].copy_from_slice(&word_bytes);
             }
+            self.state.bytes = bytes;
         } else if !addr.is_null() {
             self.state.bytes = *witness
                 .get(&addr)
@@ -258,8 +263,6 @@ impl BigIntIO for BigIntIOImpl<'_> {
 }
 
 pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
-    tracing::debug!("ecall");
-
     let blob_ptr = ctx.load_aligned_addr_from_machine_register(LoadOp::Load, REG_A0)?;
     let nondet_program_ptr = ctx.load_aligned_addr_from_machine_register(LoadOp::Load, REG_T1)?;
     let verify_program_ptr =
@@ -269,25 +272,20 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     let nondet_program_size = ctx.load_u32(LoadOp::Load, blob_ptr)?;
     let verify_program_size = ctx.load_u32(LoadOp::Load, blob_ptr + 1)?;
     let consts_size = ctx.load_u32(LoadOp::Load, blob_ptr + 2)?;
-    tracing::debug!("blob_ptr: {blob_ptr:?}");
-    tracing::debug!(
-        "nondet_program_ptr: {nondet_program_ptr:?}, nondet_program_size: {nondet_program_size}"
-    );
 
     let program_bytes = ctx.load_region(
         LoadOp::Load,
         nondet_program_ptr.baddr(),
         nondet_program_size as usize * WORD_SIZE,
     )?;
-    tracing::debug!("program_bytes: {}", program_bytes.len());
+
     let mut cursor = Cursor::new(program_bytes);
     let program = bibc::Program::decode(&mut cursor)?;
 
-    let witness = {
-        let mut io = BigIntIOImpl::new(ctx);
-        program.eval(&mut io)?;
-        std::mem::take(&mut io.witness)
-    };
+    let mut io = BigIntIOImpl::new(ctx);
+    io.witness.reserve(nondet_program_size as usize / 2);
+    program.eval(&mut io)?;
+    let witness = std::mem::take(&mut io.witness);
 
     ctx.load_region(
         LoadOp::Load,
