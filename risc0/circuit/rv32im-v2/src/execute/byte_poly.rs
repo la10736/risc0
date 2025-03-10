@@ -17,6 +17,8 @@ use std::cmp::max;
 use crate::zirgen::circuit::ExtVal;
 use anyhow::{ensure, Result};
 use auto_ops::impl_op_ex;
+use rayon;
+use rayon::prelude::*;
 use risc0_zkp::field::Elem as _;
 use smallvec::{smallvec, SmallVec};
 use wide::{i32x4, i32x8};
@@ -172,6 +174,31 @@ impl BytePolynomial {
         );
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn add_in_place(&mut self, rhs: &BytePolynomial) {
+        if self.coeffs.len() < rhs.coeffs.len() {
+            self.coeffs.resize(rhs.coeffs.len(), 0);
+        }
+
+        if rhs.coeffs.len() >= 8 {
+            add_polynomials_simd_8(&mut self.coeffs, &rhs.coeffs).unwrap();
+        } else {
+            for (i, &val) in rhs.coeffs.iter().enumerate() {
+                self.coeffs[i] += val;
+            }
+        }
+    }
+
+    pub(crate) fn mul_const_in_place(&mut self, constant: i32) {
+        if self.coeffs.len() >= 8 {
+            byte_poly_mul_const_simd(&mut self.coeffs, constant).unwrap();
+        } else {
+            for coeff in self.coeffs.iter_mut() {
+                *coeff *= constant;
+            }
+        }
+    }
 }
 
 fn byte_poly_add(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
@@ -207,8 +234,16 @@ fn byte_poly_mul(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
         return byte_poly_mul_naive(lhs, rhs);
     }
 
-    // Use Karatsuba algorithm for larger polynomials
-    let result_coeffs = karatsuba_multiply(&lhs.coeffs, &rhs.coeffs);
+    // For medium-sized polynomials, use sequential Karatsuba
+    if lhs.coeffs.len() < 64 || rhs.coeffs.len() < 64 {
+        let result_coeffs = karatsuba_multiply(&lhs.coeffs, &rhs.coeffs);
+        return BytePolynomial {
+            coeffs: result_coeffs,
+        };
+    }
+
+    // For large polynomials, use parallel Karatsuba
+    let result_coeffs = parallel_karatsuba_multiply(&lhs.coeffs, &rhs.coeffs);
     BytePolynomial {
         coeffs: result_coeffs,
     }
@@ -285,32 +320,72 @@ fn karatsuba_multiply(x: &[i32], y: &[i32]) -> SmallVec<[i32; 64]> {
     }
 
     // Combine results
-    let mut result = smallvec![0; x.len() + y.len()];
+    let result_len = x.len() + y.len();
+    let mut result = smallvec![0; result_len];
 
     // Add z0 to result
     for (i, &val) in z0.iter().enumerate() {
-        result[i] += val;
+        if i < result_len {
+            result[i] += val;
+        }
     }
 
     // Add z1 * B^m
     for (i, &val) in z1.iter().enumerate() {
-        result[i + m] += val;
+        let idx = i + m;
+        if idx < result_len {
+            result[idx] += val;
+        }
     }
 
     // Add z2 * B^(2*m)
     for (i, &val) in z2.iter().enumerate() {
-        result[i + 2 * m] += val;
+        let idx = i + 2 * m;
+        if idx < result_len {
+            result[idx] += val;
+        }
     }
 
     result
 }
 
 fn byte_poly_mul_const(lhs: &BytePolynomial, rhs: i32) -> BytePolynomial {
-    let mut ret = lhs.coeffs.clone();
-    for coeff in ret.iter_mut() {
-        *coeff *= rhs;
+    let mut ret = lhs.clone();
+    ret.mul_const_in_place(rhs);
+    ret
+}
+
+#[allow(dead_code)]
+fn byte_poly_mul_const_simd(coeffs: &mut [i32], constant: i32) -> Result<()> {
+    for chunk in 0..(coeffs.len() / 8) {
+        let start = chunk * 8;
+        let coeffs_vec = i32x8::new([
+            coeffs[start],
+            coeffs[start + 1],
+            coeffs[start + 2],
+            coeffs[start + 3],
+            coeffs[start + 4],
+            coeffs[start + 5],
+            coeffs[start + 6],
+            coeffs[start + 7],
+        ]);
+
+        // SIMD multiplication by constant
+        let const_vec = i32x8::splat(constant);
+        let result = coeffs_vec * const_vec;
+
+        // Store result back
+        let result_array = result.to_array();
+        coeffs[start..start + 8].copy_from_slice(&result_array);
     }
-    BytePolynomial { coeffs: ret }
+
+    // Handle remaining elements - fix the needless range loop
+    let remaining_start = (coeffs.len() / 8) * 8;
+    for coeff in &mut coeffs[remaining_start..] {
+        *coeff *= constant;
+    }
+
+    Ok(())
 }
 
 impl_op_ex!(+|a: &BytePolynomial, b: &BytePolynomial| -> BytePolynomial { byte_poly_add(a, b) });
@@ -394,7 +469,9 @@ impl BigIntAccum {
             PolyOp::Carry1 => {
                 self.state.poly += (delta_poly - self.neg_poly) * ExtVal::from_u32(0x4000);
             }
-            PolyOp::Carry2 => self.state.poly += delta_poly * ExtVal::from_u32(0x100),
+            PolyOp::Carry2 => {
+                self.state.poly += delta_poly * ExtVal::from_u32(0x100);
+            }
             PolyOp::EqZero => {
                 let carry = self.powers[1] - ExtVal::from_u32(0x100);
                 let goal = self.state.total + new_poly * carry;
@@ -484,4 +561,199 @@ fn add_polynomials_simd_4(dest: &mut [i32], src: &[i32]) -> Result<()> {
     }
 
     Ok(())
+}
+
+// Modify the parallel_karatsuba_multiply function to use more threads
+fn parallel_karatsuba_multiply(x: &[i32], y: &[i32]) -> SmallVec<[i32; 64]> {
+    let n = max(x.len(), y.len());
+
+    // Lower the threshold for parallelization to increase thread usage
+    if n <= 32 {
+        // Reduced from 64
+        return karatsuba_multiply(x, y);
+    }
+
+    // Split point
+    let m = n / 2;
+
+    // Split x and y into lower and upper parts - in parallel
+    let (x_parts, y_parts) = rayon::join(
+        || {
+            let low = x
+                .iter()
+                .take(std::cmp::min(m, x.len()))
+                .copied()
+                .collect::<SmallVec<[i32; 64]>>();
+            let high = x
+                .iter()
+                .skip(std::cmp::min(m, x.len()))
+                .copied()
+                .collect::<SmallVec<[i32; 64]>>();
+            (low, high)
+        },
+        || {
+            let low = y
+                .iter()
+                .take(std::cmp::min(m, y.len()))
+                .copied()
+                .collect::<SmallVec<[i32; 64]>>();
+            let high = y
+                .iter()
+                .skip(std::cmp::min(m, y.len()))
+                .copied()
+                .collect::<SmallVec<[i32; 64]>>();
+            (low, high)
+        },
+    );
+
+    let x_low = x_parts.0;
+    let x_high = x_parts.1;
+    let y_low = y_parts.0;
+    let y_high = y_parts.1;
+
+    // Compute sum of low and high parts in parallel
+    let (x_sum, y_sum) = rayon::join(
+        || {
+            let mut sum = x_low.clone();
+            // Use parallel iterator for large arrays
+            if x_high.len() > 64 {
+                // Create a new vector with the right size
+                if sum.len() < x_high.len() {
+                    sum.resize(x_high.len(), 0);
+                }
+
+                // Parallel addition using chunks
+                sum.par_iter_mut()
+                    .zip(x_high.par_iter())
+                    .for_each(|(a, &b)| *a += b);
+            } else {
+                // Sequential for smaller arrays
+                for (i, &val) in x_high.iter().enumerate() {
+                    if i < sum.len() {
+                        sum[i] += val;
+                    } else {
+                        sum.push(val);
+                    }
+                }
+            }
+            sum
+        },
+        || {
+            let mut sum = y_low.clone();
+            // Use parallel iterator for large arrays
+            if y_high.len() > 64 {
+                // Create a new vector with the right size
+                if sum.len() < y_high.len() {
+                    sum.resize(y_high.len(), 0);
+                }
+
+                // Parallel addition using chunks
+                sum.par_iter_mut()
+                    .zip(y_high.par_iter())
+                    .for_each(|(a, &b)| *a += b);
+            } else {
+                // Sequential for smaller arrays
+                for (i, &val) in y_high.iter().enumerate() {
+                    if i < sum.len() {
+                        sum[i] += val;
+                    } else {
+                        sum.push(val);
+                    }
+                }
+            }
+            sum
+        },
+    );
+
+    // Use rayon to compute z0, z1, and z2 in parallel
+    let ((z0, z2), z1_full) = rayon::join(
+        || {
+            rayon::join(
+                || parallel_karatsuba_multiply(&x_low, &y_low),
+                || parallel_karatsuba_multiply(&x_high, &y_high),
+            )
+        },
+        || parallel_karatsuba_multiply(&x_sum, &y_sum),
+    );
+
+    // z1 = z1_full - z0 - z2, do this in parallel for large arrays
+    let mut z1 = z1_full;
+
+    if z1.len() > 128 {
+        // Parallel subtraction for large arrays
+        z1.par_iter_mut().enumerate().for_each(|(i, val)| {
+            if i < z0.len() {
+                *val -= z0[i];
+            }
+            if i < z2.len() {
+                *val -= z2[i];
+            }
+        });
+    } else {
+        // Sequential for smaller arrays
+        for i in 0..z0.len() {
+            if i < z1.len() {
+                z1[i] -= z0[i];
+            }
+        }
+        for i in 0..z2.len() {
+            if i < z1.len() {
+                z1[i] -= z2[i];
+            }
+        }
+    }
+
+    // Combine results
+    let result_len = x.len() + y.len();
+    let mut result = smallvec![0; result_len];
+
+    // For large results, parallelize the final combination step
+    if result_len > 256 {
+        // Prepare an array of operations to perform
+        let operations: Vec<(usize, i32)> = z0
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v))
+            .chain(z1.iter().enumerate().map(|(i, &v)| (i + m, v)))
+            .chain(z2.iter().enumerate().map(|(i, &v)| (i + 2 * m, v)))
+            .filter(|(idx, _)| *idx < result_len)
+            .collect();
+
+        // Group operations by index
+        let mut index_map: std::collections::HashMap<usize, Vec<i32>> =
+            std::collections::HashMap::new();
+        for (idx, val) in operations {
+            index_map.entry(idx).or_default().push(val);
+        }
+
+        // Apply operations in parallel
+        result.par_iter_mut().enumerate().for_each(|(i, val)| {
+            if let Some(values) = index_map.get(&i) {
+                *val += values.iter().sum::<i32>();
+            }
+        });
+    } else {
+        // Sequential addition for smaller results
+        for (i, &val) in z0.iter().enumerate() {
+            if i < result_len {
+                result[i] += val;
+            }
+        }
+
+        for (i, &val) in z1.iter().enumerate() {
+            let idx = i + m;
+            if idx < result_len {
+                result[idx] += val;
+            }
+        }
+
+        for (i, &val) in z2.iter().enumerate() {
+            let idx = i + 2 * m;
+            if idx < result_len {
+                result[idx] += val;
+            }
+        }
+    }
+
+    result
 }

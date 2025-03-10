@@ -504,7 +504,7 @@ impl Datasheet {
         session
     }
 
-    fn bigint2_prove_segment(&mut self, session: &Session, segment: &Segment) {
+    fn _bigint2_prove_segment(&mut self, session: &Session, segment: &Segment) {
         println!("bigint2_prove_segment");
 
         let opts = ProverOpts::default();
@@ -533,8 +533,6 @@ impl Datasheet {
 
     fn bigint2(&mut self) {
         let session = self.bigint2_execute();
-        let segment = session.segments[0].resolve().unwrap();
-        self.bigint2_prove_segment(&session, &segment);
     }
 
     fn warmup(&self) {
