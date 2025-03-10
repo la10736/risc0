@@ -532,7 +532,7 @@ impl Datasheet {
     }
 
     fn bigint2(&mut self) {
-        let session = self.bigint2_execute();
+        self.bigint2_execute();
     }
 
     fn warmup(&self) {

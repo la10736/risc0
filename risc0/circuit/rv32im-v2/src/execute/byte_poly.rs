@@ -17,6 +17,7 @@ use std::cmp::max;
 use crate::zirgen::circuit::ExtVal;
 use anyhow::{ensure, Result};
 use auto_ops::impl_op_ex;
+use once_cell::sync::Lazy;
 use rayon;
 use rayon::prelude::*;
 use risc0_zkp::field::Elem as _;
@@ -418,10 +419,18 @@ pub(crate) struct BigIntAccum {
     neg_poly: ExtVal,
 }
 
+// Add ExtVal constants
+static EXT_VAL_ZERO: Lazy<ExtVal> = Lazy::new(|| ExtVal::ZERO);
+static EXT_VAL_ONE: Lazy<ExtVal> = Lazy::new(|| ExtVal::ONE);
+static EXT_VAL_0X4000: Lazy<ExtVal> = Lazy::new(|| ExtVal::from_u32(0x4000));
+static EXT_VAL_0X100: Lazy<ExtVal> = Lazy::new(|| ExtVal::from_u32(0x100));
+static EXT_VAL_4: Lazy<ExtVal> = Lazy::new(|| ExtVal::from_u32(4));
+static EXT_VAL_128: Lazy<ExtVal> = Lazy::new(|| ExtVal::from_u32(128));
+
 impl BigIntAccum {
     pub(crate) fn new(mix: ExtVal) -> Self {
         let mut powers = [ExtVal::default(); MAX_POWERS];
-        let mut cur = ExtVal::ONE;
+        let mut cur = *EXT_VAL_ONE;
         for power in powers.iter_mut() {
             *power = cur;
             cur *= mix;
@@ -430,9 +439,7 @@ impl BigIntAccum {
         let neg_poly = powers
             .iter()
             .take(BIGINT_WIDTH_BYTES)
-            .fold(ExtVal::ZERO, |acc, power| {
-                acc + *power * ExtVal::from_u32(128)
-            });
+            .fold(*EXT_VAL_ZERO, |acc, power| acc + *power * *EXT_VAL_128);
 
         Self {
             state: BigIntAccumState::new(),
@@ -442,13 +449,12 @@ impl BigIntAccum {
     }
 
     pub(crate) fn step(&mut self, state: &BigIntState) -> Result<()> {
-        let delta_poly = state
-            .bytes
-            .iter()
-            .zip(self.powers.iter().take(BIGINT_WIDTH_BYTES))
-            .fold(ExtVal::ZERO, |acc, (coeff, power)| {
-                acc + *power * ExtVal::from_u32(*coeff as u32)
-            });
+        // Pre-compute coefficient ExtVals for better SIMD optimization
+        let mut delta_poly = *EXT_VAL_ZERO;
+        for i in 0..BIGINT_WIDTH_BYTES {
+            delta_poly += self.powers[i] * ExtVal::from_u32(state.bytes[i] as u32);
+        }
+
         let new_poly = self.state.poly + delta_poly;
 
         match state.poly_op {
@@ -457,20 +463,20 @@ impl BigIntAccum {
                 self.state.poly = new_poly * self.powers[BIGINT_WIDTH_BYTES];
             }
             PolyOp::SetTerm => {
-                self.state.poly = ExtVal::ZERO;
+                self.state.poly = *EXT_VAL_ZERO;
                 self.state.term = new_poly;
             }
             PolyOp::AddTotal => {
-                let coeff = ExtVal::from_u32(state.coeff) - ExtVal::from_u32(4);
+                let coeff = ExtVal::from_u32(state.coeff) - *EXT_VAL_4;
                 self.state.total += coeff * self.state.term * new_poly;
-                self.state.poly = ExtVal::ZERO;
-                self.state.term = ExtVal::ONE;
+                self.state.poly = *EXT_VAL_ZERO;
+                self.state.term = *EXT_VAL_ONE;
             }
             PolyOp::Carry1 => {
-                self.state.poly += (delta_poly - self.neg_poly) * ExtVal::from_u32(0x4000);
+                self.state.poly += (delta_poly - self.neg_poly) * *EXT_VAL_0X4000;
             }
             PolyOp::Carry2 => {
-                self.state.poly += delta_poly * ExtVal::from_u32(0x100);
+                self.state.poly += delta_poly * *EXT_VAL_0X100;
             }
             PolyOp::EqZero => {
                 let carry = self.powers[1] - ExtVal::from_u32(0x100);

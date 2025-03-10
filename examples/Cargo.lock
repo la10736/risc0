@@ -3855,6 +3855,7 @@ dependencies = [
  "malachite",
  "num-derive",
  "num-traits",
+ "once_cell",
  "paste",
  "rand",
  "rayon",
