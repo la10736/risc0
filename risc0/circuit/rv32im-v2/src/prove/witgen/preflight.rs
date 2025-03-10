@@ -433,6 +433,11 @@ impl<'a> Preflight<'a> {
 }
 
 impl Risc0Context for Preflight<'_> {
+    fn cycles_remaining(&self) -> usize {
+        // TODO(nils)
+        return 1;
+    }
+
     fn get_pc(&self) -> ByteAddr {
         self.pc
     }
@@ -493,18 +498,38 @@ impl Risc0Context for Preflight<'_> {
         Ok(())
     }
 
-    fn on_insn_start(&mut self, _insn: &Instruction, _decoded: &DecodedInstruction) -> Result<()> {
+    fn trace_enabled(&self) -> bool {
+        false
+    }
+
+    fn on_insn_start_trace(
+        &mut self,
+        _insn: &Instruction,
+        _decoded: &DecodedInstruction,
+    ) -> Result<()> {
+        self.on_insn_start()
+    }
+    fn on_insn_start(&mut self) -> Result<()> {
         Ok(())
     }
 
-    fn on_insn_end(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()> {
+    fn on_insn_end_trace(
+        &mut self,
+        insn: &Instruction,
+        kind: InsnKind,
+        decoded: &DecodedInstruction,
+    ) -> Result<()> {
         tracing::trace!(
             "[{}]: {:?}> {}",
             self.trace.cycles.len(),
             self.pc,
             disasm(insn, decoded)
         );
-        self.add_cycle_insn(CycleState::Decode, self.pc.0, insn.kind);
+        self.on_insn_end(kind)
+    }
+
+    fn on_insn_end(&mut self, kind: InsnKind) -> Result<()> {
+        self.add_cycle_insn(CycleState::Decode, self.pc.0, kind);
         self.user_cycle += 1;
         self.phys_cycles += 1;
         Ok(())

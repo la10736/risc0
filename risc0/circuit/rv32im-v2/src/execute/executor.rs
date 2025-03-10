@@ -32,7 +32,7 @@ use super::{
     platform::*,
     poseidon2::Poseidon2State,
     r0vm::{LoadOp, Risc0Context, Risc0Machine},
-    rv32im::{disasm, DecodedInstruction, Emulator, Instruction},
+    rv32im::{disasm, DecodedInstruction, Emulator, InsnKind, Instruction},
     segment::Segment,
     sha2::Sha2State,
     syscall::Syscall,
@@ -60,6 +60,8 @@ pub struct Executor<'a, 'b, S: Syscall> {
     output_digest: Option<Digest>,
     trace: Vec<Rc<RefCell<dyn TraceCallback + 'b>>>,
     cycles: SessionCycles,
+    max_cycles: Option<u64>,
+    segment_threshold: u32,
 }
 
 pub struct ExecutorResult {
@@ -159,6 +161,8 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             output_digest: None,
             trace,
             cycles: SessionCycles::default(),
+            max_cycles: None,
+            segment_threshold: 0,
         }
     }
 
@@ -171,7 +175,8 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
     ) -> Result<ExecutorResult> {
         let segment_limit: u32 = 1 << segment_po2;
         assert!(max_insn_cycles < segment_limit as usize);
-        let segment_threshold = segment_limit - max_insn_cycles as u32;
+        self.segment_threshold = segment_limit - max_insn_cycles as u32;
+        self.max_cycles = max_cycles;
 
         self.reset();
 
@@ -197,12 +202,13 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     }
                 }
 
-                if self.segment_cycles() >= segment_threshold {
+                if self.segment_cycles() >= self.segment_threshold {
                     tracing::debug!(
-                        "split(phys: {} + pager: {} + reserved: {LOOKUP_TABLE_CYCLES}) = {} >= {segment_threshold}",
+                        "split(phys: {} + pager: {} + reserved: {LOOKUP_TABLE_CYCLES}) = {} >= {}",
                         self.phys_cycles,
                         self.pager.cycles,
-                        self.segment_cycles()
+                        self.segment_cycles(),
+                        self.segment_threshold
                     );
 
                     assert!(
@@ -225,7 +231,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                         phys_cycles: self.phys_cycles,
                         pager_cycles: self.pager.cycles,
                         terminate_state: self.terminate_state,
-                        segment_threshold,
+                        segment_threshold: self.segment_threshold,
                         pre_digest,
                         post_digest,
                         po2: segment_po2 as u32,
@@ -358,6 +364,23 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
 }
 
 impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
+    fn cycles_remaining(&self) -> usize {
+        let mut cycles_left = self.segment_threshold.saturating_sub(self.segment_cycles()) as usize;
+
+        if let Some(max_cycles) = self.max_cycles {
+            let max_left = max_cycles.saturating_sub(self.cycles.user) as usize;
+            if cycles_left > max_left {
+                cycles_left = max_left;
+            }
+        }
+
+        if cycles_left > LOOKUP_TABLE_CYCLES {
+            cycles_left - LOOKUP_TABLE_CYCLES
+        } else {
+            1
+        }
+    }
+
     fn get_pc(&self) -> ByteAddr {
         self.pc
     }
@@ -386,9 +409,22 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
         Ok(())
     }
 
-    fn on_insn_start(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()> {
-        let cycle = self.cycles.user;
+    fn on_insn_start(&mut self) -> Result<()> {
         self.cycles.user += 1;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn trace_enabled(&self) -> bool {
+        tracing::enabled!(tracing::Level::TRACE) || !self.trace.is_empty()
+    }
+
+    fn on_insn_start_trace(
+        &mut self,
+        insn: &Instruction,
+        decoded: &DecodedInstruction,
+    ) -> Result<()> {
+        let cycle = self.cycles.user;
         if tracing::enabled!(tracing::Level::TRACE) {
             self.trace_instruction(cycle, insn, decoded);
         }
@@ -397,15 +433,23 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
                 cycle,
                 pc: self.pc.0,
                 insn: decoded.insn,
-            })
-        } else {
-            Ok(())
+            })?
         }
+        self.on_insn_start()
     }
 
-    fn on_insn_end(&mut self, _insn: &Instruction, _decoded: &DecodedInstruction) -> Result<()> {
+    fn on_insn_end(&mut self, _kind: InsnKind) -> Result<()> {
         self.user_cycles += 1;
         self.phys_cycles += 1;
+        Ok(())
+    }
+    fn on_insn_end_trace(
+        &mut self,
+        _insn: &Instruction,
+        kind: InsnKind,
+        _decoded: &DecodedInstruction,
+    ) -> Result<()> {
+        self.on_insn_end(kind)?;
         if !self.trace.is_empty() {
             self.trace_pager()?;
         }

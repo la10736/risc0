@@ -21,7 +21,7 @@ use super::{
     bigint::{self, BigIntState},
     platform::*,
     poseidon2::{Poseidon2, Poseidon2State},
-    rv32im::{DecodedInstruction, EmuContext, Emulator, Exception, Instruction},
+    rv32im::{DecodedInstruction, EmuContext, Emulator, Exception, InsnKind, Instruction},
     sha2::{self, Sha2State},
 };
 
@@ -48,9 +48,24 @@ pub(crate) trait Risc0Context {
     /// Set the machine mode
     fn set_machine_mode(&mut self, mode: u32);
 
-    fn on_insn_start(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()>;
+    fn cycles_remaining(&self) -> usize;
 
-    fn on_insn_end(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()>;
+    fn trace_enabled(&self) -> bool;
+
+    fn on_insn_start(&mut self) -> Result<()>;
+    fn on_insn_start_trace(
+        &mut self,
+        insn: &Instruction,
+        decoded: &DecodedInstruction,
+    ) -> Result<()>;
+
+    fn on_insn_end(&mut self, kind: InsnKind) -> Result<()>;
+    fn on_insn_end_trace(
+        &mut self,
+        insn: &Instruction,
+        kind: InsnKind,
+        decoded: &DecodedInstruction,
+    ) -> Result<()>;
 
     fn store_register(&mut self, base: WordAddr, idx: usize, word: u32) -> Result<()> {
         self.store_u32(base + idx, word)
@@ -433,6 +448,7 @@ impl<T: Risc0Context> EmuContext for Risc0Machine<'_, T> {
         Ok(true)
     }
 
+    #[cold]
     fn trap(&mut self, cause: Exception) -> Result<bool> {
         self.ctx.trap_rewind();
         if let Exception::Breakpoint = cause {
@@ -453,12 +469,33 @@ impl<T: Risc0Context> EmuContext for Risc0Machine<'_, T> {
         Ok(false)
     }
 
-    fn on_insn_decoded(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()> {
-        self.ctx.on_insn_start(insn, decoded)
+    fn trace_enabled(&self) -> bool {
+        self.ctx.trace_enabled()
     }
 
-    fn on_normal_end(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()> {
-        self.ctx.on_insn_end(insn, decoded)
+    fn on_insn_decoded_trace(
+        &mut self,
+        insn: &Instruction,
+        decoded: &DecodedInstruction,
+    ) -> Result<()> {
+        self.ctx.on_insn_start_trace(insn, decoded)
+    }
+
+    fn on_insn_decoded(&mut self) -> Result<()> {
+        self.ctx.on_insn_start()
+    }
+
+    fn on_normal_end_trace(
+        &mut self,
+        insn: &Instruction,
+        kind: InsnKind,
+        decoded: &DecodedInstruction,
+    ) -> Result<()> {
+        self.ctx.on_insn_end_trace(insn, kind, decoded)
+    }
+
+    fn on_normal_end(&mut self, kind: InsnKind) -> Result<()> {
+        self.ctx.on_insn_end(kind)
     }
 
     fn get_pc(&self) -> ByteAddr {
@@ -490,6 +527,10 @@ impl<T: Risc0Context> EmuContext for Risc0Machine<'_, T> {
 
     fn load_memory(&mut self, addr: WordAddr) -> Result<u32> {
         self.ctx.load_u32(LoadOp::Record, addr)
+    }
+
+    fn cycles_remaining(&self) -> usize {
+        self.ctx.cycles_remaining()
     }
 
     fn store_memory(&mut self, addr: WordAddr, word: u32) -> Result<()> {

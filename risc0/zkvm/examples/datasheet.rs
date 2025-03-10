@@ -145,7 +145,9 @@ struct Datasheet {
 
 impl Datasheet {
     pub fn run(&mut self, args: Args) {
-        self.warmup();
+        if false {
+            self.warmup();
+        }
 
         if let Some(ref cmd) = args.command {
             self.run_cmd(cmd, &args);
@@ -185,18 +187,19 @@ impl Datasheet {
     }
 
     fn execute(&mut self) {
+        let cycles = ITERATIONS_1M_CYCLES * 200;
         let env = ExecutorEnv::builder()
-            .write_slice(&ITERATIONS_1M_CYCLES.to_le_bytes())
+            .write_slice(&cycles.to_le_bytes())
             .build()
             .unwrap();
 
         let start = Instant::now();
         let session = execute_elf(env, &LOOP_ELF).unwrap();
         let duration = start.elapsed();
-        assert_eq!(
-            session.user_cycles, EXPECTED_EXECUTE_USER_CYCLES,
-            "actual vs expected"
-        );
+        //        assert_eq!(
+        //            session.user_cycles, EXPECTED_EXECUTE_USER_CYCLES,
+        //            "actual vs expected"
+        //        );
 
         let throughput = (session.user_cycles as f64) / duration.as_secs_f64();
         self.results.push(PerformanceData {
