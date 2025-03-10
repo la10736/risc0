@@ -103,6 +103,42 @@ impl BytePolyProgram {
         self.term = BytePolynomial::one();
         self.total = BytePolynomial::zero();
     }
+
+    #[allow(dead_code)]
+    pub fn is_zero_in_range_simd(program: &BytePolyProgram, range: std::ops::Range<usize>) -> bool {
+        let slice = &program.total_carry.coeffs[range.clone()];
+        let len = slice.len();
+
+        // Process in chunks of 8
+        let chunks = len / 8;
+        for chunk in 0..chunks {
+            let start = chunk * 8;
+
+            // Create a SIMD vector
+            let vec = i32x8::new([
+                slice[start],
+                slice[start + 1],
+                slice[start + 2],
+                slice[start + 3],
+                slice[start + 4],
+                slice[start + 5],
+                slice[start + 6],
+                slice[start + 7],
+            ]);
+
+            // Create a zero vector
+            let zero_vec = i32x8::splat(0);
+
+            // Check if not equal to zero
+            if vec != zero_vec {
+                return false;
+            }
+        }
+
+        // Check remaining elements
+        let remaining_start = chunks * 8;
+        slice[remaining_start..].iter().all(|&x| x == 0)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -166,6 +202,20 @@ fn byte_poly_add(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
 }
 
 fn byte_poly_mul(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
+    // For very small polynomials, use the naive approach as it's faster
+    if lhs.coeffs.len() < 8 || rhs.coeffs.len() < 8 {
+        return byte_poly_mul_naive(lhs, rhs);
+    }
+
+    // Use Karatsuba algorithm for larger polynomials
+    let result_coeffs = karatsuba_multiply(&lhs.coeffs, &rhs.coeffs);
+    BytePolynomial {
+        coeffs: result_coeffs,
+    }
+}
+
+// Original naive implementation kept for small polynomials
+fn byte_poly_mul_naive(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
     let mut ret = smallvec![0; lhs.coeffs.len() + rhs.coeffs.len()];
     for (i, lhs) in lhs.coeffs.iter().enumerate() {
         for (j, rhs) in rhs.coeffs.iter().enumerate() {
@@ -173,6 +223,86 @@ fn byte_poly_mul(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
         }
     }
     BytePolynomial { coeffs: ret }
+}
+
+// Karatsuba algorithm for polynomial multiplication: O(n^1.58) complexity
+fn karatsuba_multiply(x: &[i32], y: &[i32]) -> SmallVec<[i32; 64]> {
+    let n = max(x.len(), y.len());
+
+    // Base case for recursion
+    if n <= 16 {
+        let mut result = smallvec![0; x.len() + y.len()];
+        for (i, &x_i) in x.iter().enumerate() {
+            for (j, &y_j) in y.iter().enumerate() {
+                result[i + j] += x_i * y_j;
+            }
+        }
+        return result;
+    }
+
+    // Split point
+    let m = n / 2;
+
+    // Split x and y into lower and upper parts
+    let x_low: SmallVec<[i32; 64]> = x.iter().take(std::cmp::min(m, x.len())).copied().collect();
+    let x_high: SmallVec<[i32; 64]> = x.iter().skip(std::cmp::min(m, x.len())).copied().collect();
+
+    let y_low: SmallVec<[i32; 64]> = y.iter().take(std::cmp::min(m, y.len())).copied().collect();
+    let y_high: SmallVec<[i32; 64]> = y.iter().skip(std::cmp::min(m, y.len())).copied().collect();
+
+    // Karatsuba steps
+    let z0 = karatsuba_multiply(&x_low, &y_low);
+    let z2 = karatsuba_multiply(&x_high, &y_high);
+
+    // Compute sum of low and high parts
+    let mut x_sum = x_low.clone();
+    for (i, &val) in x_high.iter().enumerate() {
+        if i < x_sum.len() {
+            x_sum[i] += val;
+        } else {
+            x_sum.push(val);
+        }
+    }
+
+    let mut y_sum = y_low.clone();
+    for (i, &val) in y_high.iter().enumerate() {
+        if i < y_sum.len() {
+            y_sum[i] += val;
+        } else {
+            y_sum.push(val);
+        }
+    }
+
+    let z1_full = karatsuba_multiply(&x_sum, &y_sum);
+
+    // z1 = z1_full - z0 - z2
+    let mut z1 = z1_full;
+    for i in 0..z0.len() {
+        z1[i] -= z0[i];
+    }
+    for i in 0..z2.len() {
+        z1[i] -= z2[i];
+    }
+
+    // Combine results
+    let mut result = smallvec![0; x.len() + y.len()];
+
+    // Add z0 to result
+    for (i, &val) in z0.iter().enumerate() {
+        result[i] += val;
+    }
+
+    // Add z1 * B^m
+    for (i, &val) in z1.iter().enumerate() {
+        result[i + m] += val;
+    }
+
+    // Add z2 * B^(2*m)
+    for (i, &val) in z2.iter().enumerate() {
+        result[i + 2 * m] += val;
+    }
+
+    result
 }
 
 fn byte_poly_mul_const(lhs: &BytePolynomial, rhs: i32) -> BytePolynomial {
