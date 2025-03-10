@@ -104,7 +104,7 @@ struct ComputePartialImageRequest {
 }
 
 /// Maximum number of segments we can queue up before we block execution
-const MAX_OUTSTANDING_SEGMENTS: usize = 5;
+const MAX_OUTSTANDING_SEGMENTS: usize = 100;
 
 fn compute_partial_images(
     recv: std::sync::mpsc::Receiver<ComputePartialImageRequest>,
