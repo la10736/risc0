@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::max;
-
 use crate::zirgen::circuit::ExtVal;
 use anyhow::{ensure, Result};
 use auto_ops::impl_op_ex;
 use once_cell::sync::Lazy;
-use rayon;
 use rayon::prelude::*;
 use risc0_zkp::field::Elem as _;
+// use risc0_zkp::prove::executor::Executor;
 use smallvec::{smallvec, SmallVec};
-use wide::{i32x4, i32x8};
+use std::cmp::max;
+use wide::i32x8;
 
 use super::bigint::{BigIntState, Instruction, PolyOp, BIGINT_WIDTH_BYTES};
 
@@ -178,16 +177,18 @@ impl BytePolynomial {
 
     #[allow(dead_code)]
     pub(crate) fn add_in_place(&mut self, rhs: &BytePolynomial) {
-        if self.coeffs.len() < rhs.coeffs.len() {
+        if rhs.coeffs.len() > self.coeffs.len() {
+            let old_len = self.coeffs.len();
             self.coeffs.resize(rhs.coeffs.len(), 0);
-        }
-
-        if rhs.coeffs.len() >= 8 {
-            add_polynomials_simd_8(&mut self.coeffs, &rhs.coeffs).unwrap();
-        } else {
-            for (i, &val) in rhs.coeffs.iter().enumerate() {
-                self.coeffs[i] += val;
+            for i in 0..old_len {
+                self.coeffs[i] += rhs.coeffs[i];
             }
+            for i in old_len..rhs.coeffs.len() {
+                self.coeffs[i] = rhs.coeffs[i];
+            }
+        } else {
+            // Use our optimized SIMD function for the common case
+            add_polynomials_simd(&mut self.coeffs[..rhs.coeffs.len()], &rhs.coeffs);
         }
     }
 
@@ -202,6 +203,53 @@ impl BytePolynomial {
     }
 }
 
+fn add_polynomials_simd(a: &mut [i32], b: &[i32]) {
+    use wide::i32x8;
+
+    // Process in 8-element chunks for best SIMD performance
+    let simd_chunks = a.len().min(b.len()) / 8;
+    for i in 0..simd_chunks {
+        let idx = i * 8;
+
+        // Load values into arrays
+        let a_arr = [
+            a[idx],
+            a[idx + 1],
+            a[idx + 2],
+            a[idx + 3],
+            a[idx + 4],
+            a[idx + 5],
+            a[idx + 6],
+            a[idx + 7],
+        ];
+        let b_arr = [
+            b[idx],
+            b[idx + 1],
+            b[idx + 2],
+            b[idx + 3],
+            b[idx + 4],
+            b[idx + 5],
+            b[idx + 6],
+            b[idx + 7],
+        ];
+
+        // Use wide's SIMD operations
+        let a_vec = i32x8::from(a_arr);
+        let b_vec = i32x8::from(b_arr);
+        let sum = a_vec + b_vec;
+
+        // Store results back
+        let result_arr: [i32; 8] = sum.into();
+        a[idx..idx + 8].copy_from_slice(&result_arr);
+    }
+
+    // Handle remaining elements
+    let processed = simd_chunks * 8;
+    for i in processed..a.len().min(b.len()) {
+        a[i] += b[i];
+    }
+}
+
 fn byte_poly_add(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
     let max_len = max(lhs.coeffs.len(), rhs.coeffs.len());
     let mut ret = smallvec![0; max_len];
@@ -211,19 +259,10 @@ fn byte_poly_add(lhs: &BytePolynomial, rhs: &BytePolynomial) -> BytePolynomial {
         ret[..lhs.coeffs.len()].copy_from_slice(&lhs.coeffs);
     }
 
-    // Then use SIMD to add the second polynomial to the result
+    // Then use the new, optimized SIMD implementation to add the second polynomial
     if !rhs.coeffs.is_empty() {
-        // Use SIMD for the common part
-        if rhs.coeffs.len() >= 8 {
-            add_polynomials_simd_8(&mut ret[..rhs.coeffs.len()], &rhs.coeffs).unwrap();
-        } else if rhs.coeffs.len() >= 4 {
-            add_polynomials_simd_4(&mut ret[..rhs.coeffs.len()], &rhs.coeffs).unwrap();
-        } else {
-            // For very small polynomials, just use normal addition
-            for (i, &coeff) in rhs.coeffs.iter().enumerate() {
-                ret[i] += coeff;
-            }
-        }
+        // Use our local SIMD implementation that handles all sizes efficiently
+        add_polynomials_simd(&mut ret[..rhs.coeffs.len()], &rhs.coeffs);
     }
 
     BytePolynomial { coeffs: ret }
@@ -492,81 +531,6 @@ impl BigIntAccum {
     fn reset(&mut self) {
         self.state = BigIntAccumState::new();
     }
-}
-
-fn add_polynomials_simd_8(dest: &mut [i32], src: &[i32]) -> Result<()> {
-    for chunk in 0..(dest.len() / 8) {
-        let start = chunk * 8;
-
-        // Load 8 elements at once
-        let dest_vec = i32x8::new([
-            dest[start],
-            dest[start + 1],
-            dest[start + 2],
-            dest[start + 3],
-            dest[start + 4],
-            dest[start + 5],
-            dest[start + 6],
-            dest[start + 7],
-        ]);
-
-        let src_vec = i32x8::new([
-            src[start],
-            src[start + 1],
-            src[start + 2],
-            src[start + 3],
-            src[start + 4],
-            src[start + 5],
-            src[start + 6],
-            src[start + 7],
-        ]);
-
-        // SIMD addition
-        let result = dest_vec + src_vec;
-
-        // Store result
-        let result_array = result.to_array();
-        dest[start..start + 8].copy_from_slice(&result_array);
-    }
-
-    // Handle remaining elements
-    let remaining_start = (dest.len() / 8) * 8;
-    for i in remaining_start..dest.len() {
-        dest[i] += src[i];
-    }
-
-    Ok(())
-}
-
-fn add_polynomials_simd_4(dest: &mut [i32], src: &[i32]) -> Result<()> {
-    for chunk in 0..(dest.len() / 8) {
-        let start = chunk * 8;
-
-        // Load 8 elements at once
-        let dest_vec = i32x4::new([
-            dest[start],
-            dest[start + 1],
-            dest[start + 2],
-            dest[start + 3],
-        ]);
-
-        let src_vec = i32x4::new([src[start], src[start + 1], src[start + 2], src[start + 3]]);
-
-        // SIMD addition
-        let result = dest_vec + src_vec;
-
-        // Store result
-        let result_array = result.to_array();
-        dest[start..start + 8].copy_from_slice(&result_array);
-    }
-
-    // Handle remaining elements
-    let remaining_start = (dest.len() / 4) * 4;
-    for i in remaining_start..dest.len() {
-        dest[i] += src[i];
-    }
-
-    Ok(())
 }
 
 // Modify the parallel_karatsuba_multiply function to use more threads

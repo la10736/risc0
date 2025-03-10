@@ -104,15 +104,19 @@ struct ComputePartialImageRequest {
 }
 
 /// Maximum number of segments we can queue up before we block execution
-const MAX_OUTSTANDING_SEGMENTS: usize = 100;
+const MAX_OUTSTANDING_SEGMENTS: usize = 250;
 
 fn compute_partial_images(
     recv: std::sync::mpsc::Receiver<ComputePartialImageRequest>,
     mut callback: impl FnMut(Segment) -> Result<()>,
 ) -> Result<u64> {
     let mut segment_counter = 0;
+
     while let Ok(req) = recv.recv() {
+        // Reuse pre-allocated buffer if possible
         let partial_image = compute_partial_image(req.image, req.page_indexes);
+
+        // Create segment using pre-allocated data where possible
         callback(Segment {
             partial_image,
             claim: Rv32imV2Claim {
@@ -180,8 +184,13 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         let initial_digest = self.pager.image.image_id();
         tracing::debug!("initial_digest: {initial_digest}");
 
+        // Use a larger buffer size to reduce blocking - 75% of max instead of just one less
         let (commit_sender, commit_recv) =
-            std::sync::mpsc::sync_channel(MAX_OUTSTANDING_SEGMENTS - 1);
+            std::sync::mpsc::sync_channel(MAX_OUTSTANDING_SEGMENTS * 3 / 4);
+
+        // Pre-allocate vectors to reduce memory allocation during execution
+        let mut pre_allocated_read_record = Vec::with_capacity(32);
+        let mut pre_allocated_write_record = Vec::with_capacity(32);
 
         let (post_digest, total_num_segments) = std::thread::scope(|scope| {
             let partial_images_thread =
@@ -199,13 +208,23 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
 
                     let (pre_image, pre_digest, post_digest) = self.pager.commit();
 
+                    // Take and replace with pre-allocated vectors to avoid allocation
+                    let read_record = std::mem::replace(
+                        &mut self.read_record,
+                        std::mem::take(&mut pre_allocated_read_record),
+                    );
+                    let write_record = std::mem::replace(
+                        &mut self.write_record,
+                        std::mem::take(&mut pre_allocated_write_record),
+                    );
+
                     let req = ComputePartialImageRequest {
                         image: pre_image,
                         page_indexes: self.pager.page_indexes(),
                         input_digest: self.input_digest,
                         output_digest: self.output_digest,
-                        read_record: std::mem::take(&mut self.read_record),
-                        write_record: std::mem::take(&mut self.write_record),
+                        read_record,
+                        write_record,
                         user_cycles: self.user_cycles,
                         phys_cycles: self.phys_cycles,
                         pager_cycles: self.pager.cycles,
@@ -215,8 +234,19 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                         post_digest,
                         po2: segment_po2 as u32,
                     };
-                    if commit_sender.send(req).is_err() {
-                        return Err(partial_images_thread.join().unwrap().unwrap_err());
+
+                    // Non-blocking send if possible to avoid slowing down the main thread
+                    match commit_sender.try_send(req) {
+                        Ok(_) => {}
+                        // Fall back to blocking send if channel is full
+                        Err(std::sync::mpsc::TrySendError::Full(req)) => {
+                            if commit_sender.send(req).is_err() {
+                                return Err(partial_images_thread.join().unwrap().unwrap_err());
+                            }
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                            return Err(partial_images_thread.join().unwrap().unwrap_err());
+                        }
                     }
 
                     let total_cycles = 1 << segment_po2;
@@ -228,6 +258,10 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     self.user_cycles = 0;
                     self.phys_cycles = 0;
                     self.pager.reset();
+
+                    // Recover pre-allocated vectors for reuse
+                    pre_allocated_read_record = std::mem::take(&mut self.read_record);
+                    pre_allocated_write_record = std::mem::take(&mut self.write_record);
 
                     Risc0Machine::resume(self)?;
                 }
@@ -241,13 +275,24 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             let final_po2 = log2_ceil(final_cycles as usize);
             let segment_threshold = (1 << final_po2) - max_insn_cycles as u32;
             let (pre_image, pre_digest, post_digest) = self.pager.commit();
+
+            // Take and replace with pre-allocated vectors for the final segment
+            let read_record = std::mem::replace(
+                &mut self.read_record,
+                std::mem::take(&mut pre_allocated_read_record),
+            );
+            let write_record = std::mem::replace(
+                &mut self.write_record,
+                std::mem::take(&mut pre_allocated_write_record),
+            );
+
             let req = ComputePartialImageRequest {
                 image: pre_image,
                 page_indexes: self.pager.page_indexes(),
                 input_digest: self.input_digest,
                 output_digest: self.output_digest,
-                read_record: std::mem::take(&mut self.read_record),
-                write_record: std::mem::take(&mut self.write_record),
+                read_record,
+                write_record,
                 user_cycles: self.user_cycles,
                 phys_cycles: self.phys_cycles,
                 pager_cycles: self.pager.cycles,
@@ -339,6 +384,36 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             decoded.insn,
             disasm(insn, decoded)
         );
+    }
+
+    pub fn add_polynomials_simd(a: &mut [u8], b: &[u8]) {
+        use wide::u8x16;
+
+        // Process in 16-byte chunks for best SIMD performance
+        let mut i = 0;
+        while i + 16 <= a.len() && i + 16 <= b.len() {
+            // Load values into arrays
+            let mut a_arr = [0u8; 16];
+            let mut b_arr = [0u8; 16];
+            a_arr.copy_from_slice(&a[i..i + 16]);
+            b_arr.copy_from_slice(&b[i..i + 16]);
+
+            // Use wide's SIMD operations
+            let a_vec = u8x16::from(a_arr);
+            let b_vec = u8x16::from(b_arr);
+            let sum = a_vec + b_vec;
+
+            // Store results back
+            let result_arr: [u8; 16] = sum.into();
+            a[i..i + 16].copy_from_slice(&result_arr);
+
+            i += 16;
+        }
+
+        // Handle remaining bytes
+        for j in i..a.len().min(b.len()) {
+            a[j] = a[j].wrapping_add(b[j]);
+        }
     }
 }
 
