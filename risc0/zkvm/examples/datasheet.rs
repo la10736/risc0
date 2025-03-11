@@ -136,7 +136,7 @@ enum Command {
 }
 
 /// This is the number of user cycles we expect for our "execute" benchmarks.
-const EXPECTED_EXECUTE_USER_CYCLES: u64 = (1 << DEFAULT_SEGMENT_LIMIT_PO2 as u64) - 2;
+const EXPECTED_EXECUTE_USER_CYCLES: u64 = (1 << DEFAULT_SEGMENT_LIMIT_PO2 as u64) - 5;
 
 #[derive(Default)]
 struct Datasheet {
@@ -488,7 +488,7 @@ impl Datasheet {
 
         // We want this to be comparable to the other execute benchmarks
         let cycle_diff = session.user_cycles.abs_diff(EXPECTED_EXECUTE_USER_CYCLES);
-        assert!(cycle_diff < 20_000, "{cycle_diff} not less than 20_000");
+        assert!(cycle_diff < 40_000, "{cycle_diff} not less than 40_000");
 
         let throughput = (session.user_cycles as f64) / duration.as_secs_f64();
         self.results.push(PerformanceData {

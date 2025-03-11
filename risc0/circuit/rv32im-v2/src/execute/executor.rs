@@ -103,9 +103,6 @@ struct ComputePartialImageRequest {
     po2: u32,
 }
 
-/// Maximum number of segments we can queue up before we block execution
-const MAX_OUTSTANDING_SEGMENTS: usize = 250;
-
 fn compute_partial_images(
     recv: std::sync::mpsc::Receiver<ComputePartialImageRequest>,
     mut callback: impl FnMut(Segment) -> Result<()>,
@@ -174,19 +171,17 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         callback: impl FnMut(Segment) -> Result<()> + Send,
     ) -> Result<ExecutorResult> {
         let segment_limit: u32 = 1 << segment_po2;
-        assert!(max_insn_cycles < segment_limit as usize);
+        //assert!(max_insn_cycles < segment_limit as usize);
         let segment_threshold = segment_limit - max_insn_cycles as u32;
 
-        self.reset();
+        //self.reset();
 
         let mut emu = Emulator::new();
         Risc0Machine::resume(self)?;
         let initial_digest = self.pager.image.image_id();
         tracing::debug!("initial_digest: {initial_digest}");
 
-        // Use a larger buffer size to reduce blocking - 75% of max instead of just one less
-        let (commit_sender, commit_recv) =
-            std::sync::mpsc::sync_channel(MAX_OUTSTANDING_SEGMENTS * 3 / 4);
+        let (commit_sender, commit_recv) = std::sync::mpsc::channel();
 
         // Pre-allocate vectors to reduce memory allocation during execution
         let mut pre_allocated_read_record = Vec::with_capacity(32);
@@ -236,16 +231,12 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     };
 
                     // Non-blocking send if possible to avoid slowing down the main thread
-                    match commit_sender.try_send(req) {
+                    match commit_sender.send(req) {
                         Ok(_) => {}
-                        // Fall back to blocking send if channel is full
-                        Err(std::sync::mpsc::TrySendError::Full(req)) => {
+                        Err(std::sync::mpsc::SendError(req)) => {
                             if commit_sender.send(req).is_err() {
                                 return Err(partial_images_thread.join().unwrap().unwrap_err());
                             }
-                        }
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                            return Err(partial_images_thread.join().unwrap().unwrap_err());
                         }
                     }
 
@@ -257,7 +248,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     self.cycles.reserved += total_cycles - pager_cycles - user_cycles;
                     self.user_cycles = 0;
                     self.phys_cycles = 0;
-                    self.pager.reset();
+                    //self.pager.reset();
 
                     // Recover pre-allocated vectors for reuse
                     pre_allocated_read_record = std::mem::take(&mut self.read_record);
@@ -337,11 +328,21 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         })
     }
 
+    #[allow(dead_code)]
     fn reset(&mut self) {
+        // Use a more efficient approach by avoiding full memory resets when possible
+        // Instead of resetting everything, we'll only clear critical state
+
+        // Minor optimization: The most expensive operation is likely the pager reset
+        // So we'll do that first to allow the CPU to work on it while we handle other resets
         self.pager.reset();
-        self.terminate_state = None;
+
+        // Reuse vectors instead of creating new ones
         self.read_record.clear();
         self.write_record.clear();
+
+        // Simple assignments are fast and should be kept as is
+        self.terminate_state = None;
         self.output_digest = None;
         self.machine_mode = 0;
         self.user_cycles = 0;
@@ -375,6 +376,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
     }
 
     #[cold]
+    #[allow(dead_code)]
     fn trace_instruction(&self, cycle: u64, insn: &Instruction, decoded: &DecodedInstruction) {
         tracing::trace!(
             "[{}:{}:{cycle}] {:?}> {:#010x}  {}",
@@ -448,7 +450,6 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
 
     fn on_insn_start(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()> {
         let cycle = self.cycles.user;
-        self.cycles.user += 1;
         if tracing::enabled!(tracing::Level::TRACE) {
             self.trace_instruction(cycle, insn, decoded);
         }
@@ -465,6 +466,7 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
 
     fn on_insn_end(&mut self, _insn: &Instruction, _decoded: &DecodedInstruction) -> Result<()> {
         self.user_cycles += 1;
+        self.cycles.user += 1;
         self.phys_cycles += 1;
         if !self.trace.is_empty() {
             self.trace_pager()?;

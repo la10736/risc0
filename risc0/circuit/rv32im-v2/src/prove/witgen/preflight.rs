@@ -494,6 +494,7 @@ impl Risc0Context for Preflight<'_> {
     }
 
     fn on_insn_start(&mut self, _insn: &Instruction, _decoded: &DecodedInstruction) -> Result<()> {
+        // no-op implementation, similar to other no-op methods in this implementation
         Ok(())
     }
 

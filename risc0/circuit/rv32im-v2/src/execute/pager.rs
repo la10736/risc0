@@ -101,6 +101,7 @@ impl PageStates {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn get(&self, index: u32) -> PageState {
         if self.states.get(index as usize * 2).unwrap() {
             // b10 | b11 => Dirty
@@ -179,9 +180,14 @@ impl PageTable {
         }
     }
 
+    #[inline(always)]
     fn get(&self, index: u32) -> Option<usize> {
         let value = self.table[index as usize] as usize;
-        value.checked_sub(1)
+        if value > 0 {
+            Some(value - 1)
+        } else {
+            None
+        }
     }
 
     fn set(&mut self, index: u32, value: usize) {
@@ -189,10 +195,22 @@ impl PageTable {
     }
 
     fn clear(&mut self) {
-        // You would think its faster to re-use the memory, but filling it with zeros is
-        // slower
-        // than just allocating a new piece of zeroed memory.
-        self.table = vec![Self::INVALID_IDX; NUM_PAGES];
+        if self.table.is_empty() {
+            // For the initial case, allocate a new vector
+            self.table = vec![Self::INVALID_IDX; NUM_PAGES];
+        } else if self.table.len() == NUM_PAGES {
+            // For subsequent calls, reuse existing memory with optimized clearing
+            // Use chunks to improve cache locality
+            const CHUNK_SIZE: usize = 1024;
+            for chunk in self.table.chunks_mut(CHUNK_SIZE) {
+                for item in chunk {
+                    *item = Self::INVALID_IDX;
+                }
+            }
+        } else {
+            // If the size has changed, reallocate
+            self.table = vec![Self::INVALID_IDX; NUM_PAGES];
+        }
     }
 }
 
@@ -254,7 +272,36 @@ impl PagedMemory {
     }
 
     pub(crate) fn reset(&mut self) {
-        self.page_table.clear();
+        // Instead of allocating a new page table, prefetch and zero the existing one
+        if !self.page_table.table.is_empty() {
+            // Prefetch the page table into cache line by line to avoid cache misses
+            let table_ptr = self.page_table.table.as_ptr();
+            let mut offset = 0;
+
+            // Loop through the table in cache-line sized chunks (typically 64 bytes)
+            let cache_line_size = 64; // bytes
+            let stride = cache_line_size / std::mem::size_of::<u32>();
+
+            while offset < self.page_table.table.len() {
+                // Manual prefetch at cache-line boundaries to improve performance
+                // Use read-ahead to ensure we're prefetching future lines
+                unsafe {
+                    // Simple pointer read to trigger prefetch without compiler optimizing it away
+                    let _ = std::ptr::read_volatile(table_ptr.add(offset));
+                }
+
+                // Zero out the cache line we just prefetched
+                let end = std::cmp::min(offset + stride, self.page_table.table.len());
+                for i in offset..end {
+                    self.page_table.table[i] = PageTable::INVALID_IDX;
+                }
+
+                offset += stride;
+            }
+        } else {
+            self.page_table.clear();
+        }
+
         self.page_cache.clear();
         self.page_states.clear();
         self.cycles = RESERVED_PAGING_CYCLES;
@@ -276,6 +323,8 @@ impl PagedMemory {
         }
     }
 
+    #[deprecated(note = "Use optimized store() directly instead")]
+    #[allow(dead_code)]
     fn try_store_register(&mut self, addr: WordAddr, word: u32) -> bool {
         if addr >= USER_REGS_ADDR.waddr() && addr < USER_REGS_ADDR.waddr() + REG_MAX {
             let reg_idx = addr - USER_REGS_ADDR.waddr();
@@ -322,29 +371,53 @@ impl PagedMemory {
         }
     }
 
-    fn load_ram(&mut self, addr: WordAddr) -> Result<u32> {
-        let page_idx = addr.page_idx();
-        let node_idx = node_idx(page_idx);
-        // tracing::trace!("load: {addr:?}, page: {page_idx:#08x}, node: {node_idx:#08x}");
-        let cache_idx = if let Some(cache_idx) = self.page_table.get(page_idx) {
-            cache_idx
-        } else {
-            self.load_page(page_idx)?;
-            self.page_states.set(node_idx, PageState::Loaded);
-            self.page_table.get(page_idx).unwrap()
-        };
-        Ok(self.page_cache[cache_idx].load(addr))
-    }
-
     pub(crate) fn load(&mut self, addr: WordAddr) -> Result<u32> {
-        if addr >= MEMORY_END_ADDR {
-            bail!("Invalid load address: {addr:?}");
+        #[cold]
+        fn handle_error(addr: WordAddr) -> Result<u32> {
+            bail!("Invalid load address: {addr:?}")
         }
 
-        match self.try_load_register(addr) {
-            Some(word) => Ok(word),
-            None => self.load_ram(addr),
+        // Fast path - directly check if address is a register to avoid extra function call overhead
+        if addr >= USER_REGS_ADDR.waddr() && addr < USER_REGS_ADDR.waddr() + REG_MAX {
+            let reg_idx = addr - USER_REGS_ADDR.waddr();
+            return Ok(self.user_registers[reg_idx.0 as usize]);
+        } else if addr >= MACHINE_REGS_ADDR.waddr() && addr < MACHINE_REGS_ADDR.waddr() + REG_MAX {
+            let reg_idx = addr - MACHINE_REGS_ADDR.waddr();
+            return Ok(self.machine_registers[reg_idx.0 as usize]);
         }
+
+        if addr >= MEMORY_END_ADDR {
+            return handle_error(addr);
+        }
+
+        // Memory access path
+        let page_idx = addr.page_idx();
+
+        // Prefetch page table entry to reduce cache miss latency
+        let cache_idx_opt = self.page_table.get(page_idx);
+
+        // If we have the page in cache, fast path
+        if let Some(cache_idx) = cache_idx_opt {
+            // Prefetch the actual page data
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            unsafe {
+                // Cast to byte pointer for prefetching
+                let page_ptr = &self.page_cache[cache_idx] as *const _ as *const u8;
+                // Lightweight prefetch hint without compiler optimization
+                std::ptr::read_volatile(page_ptr);
+            }
+
+            return Ok(self.page_cache[cache_idx].load(addr));
+        }
+
+        // Slow path - page miss
+        let node_idx = node_idx(page_idx);
+        self.load_page(page_idx)?;
+        self.page_states.set(node_idx, PageState::Loaded);
+
+        // After loading, we know it's now in the cache
+        let cache_idx = self.page_table.get(page_idx).unwrap();
+        Ok(self.page_cache[cache_idx].load(addr))
     }
 
     pub(crate) fn load_register(&mut self, base: WordAddr, idx: usize) -> u32 {
@@ -357,24 +430,71 @@ impl PagedMemory {
         }
     }
 
-    fn store_ram(&mut self, addr: WordAddr, word: u32) -> Result<()> {
-        // tracing::trace!("store: {addr:?}, page: {page_idx:#08x}, word: {word:#010x}");
+    pub(crate) fn store(&mut self, addr: WordAddr, word: u32) -> Result<()> {
+        #[cold]
+        fn handle_error(addr: WordAddr) -> Result<()> {
+            bail!("Invalid store address: {addr:?}")
+        }
+
+        // Fast path - directly check if address is a register to avoid function call overhead
+        if addr >= USER_REGS_ADDR.waddr() && addr < USER_REGS_ADDR.waddr() + REG_MAX {
+            let reg_idx = addr - USER_REGS_ADDR.waddr();
+            self.user_registers[reg_idx.0 as usize] = word;
+            return Ok(());
+        } else if addr >= MACHINE_REGS_ADDR.waddr() && addr < MACHINE_REGS_ADDR.waddr() + REG_MAX {
+            let reg_idx = addr - MACHINE_REGS_ADDR.waddr();
+            self.machine_registers[reg_idx.0 as usize] = word;
+            return Ok(());
+        }
+
+        if addr >= MEMORY_END_ADDR {
+            return handle_error(addr);
+        }
+
+        // Memory store path
         let page_idx = addr.page_idx();
-        let page = self.page_for_writing(page_idx)?;
+        let node_idx = node_idx(page_idx);
+
+        // Optimize the page lookup
+        let page = if let Some(cache_idx) = self.page_table.get(page_idx) {
+            let current_state = self.page_states.get(node_idx);
+
+            // If the page is loaded but not dirty, mark it dirty
+            if current_state == PageState::Loaded {
+                self.cycles += PAGE_CYCLES;
+
+                // Only trace if needed (rare case)
+                if self.tracing_enabled {
+                    self.trace_page_out(PAGE_CYCLES);
+                }
+
+                self.fixup_costs(node_idx, PageState::Dirty);
+                self.page_states.set(node_idx, PageState::Dirty);
+            }
+
+            // Get the page from cache
+            &mut self.page_cache[cache_idx]
+        } else {
+            // Page not in cache, load it
+            self.load_page(page_idx)?;
+
+            // Since it's a fresh load, mark it dirty
+            self.cycles += PAGE_CYCLES;
+            if self.tracing_enabled {
+                self.trace_page_out(PAGE_CYCLES);
+            }
+
+            self.fixup_costs(node_idx, PageState::Dirty);
+            self.page_states.set(node_idx, PageState::Dirty);
+
+            // Now we know the page is in the cache
+            let cache_idx = self.page_table.get(page_idx).unwrap();
+            &mut self.page_cache[cache_idx]
+        };
+
+        // Finally store to the page
         page.store(addr, word);
         Ok(())
-    }
-
-    pub(crate) fn store(&mut self, addr: WordAddr, word: u32) -> Result<()> {
-        if addr >= MEMORY_END_ADDR {
-            bail!("Invalid store address: {addr:?}");
-        }
-
-        if self.try_store_register(addr, word) {
-            Ok(())
-        } else {
-            self.store_ram(addr, word)
-        }
     }
 
     pub(crate) fn store_register(&mut self, base: WordAddr, idx: usize, word: u32) {
@@ -387,6 +507,8 @@ impl PagedMemory {
         }
     }
 
+    #[deprecated(note = "Use optimized store() directly instead")]
+    #[allow(dead_code)]
     fn page_for_writing(&mut self, page_idx: u32) -> Result<&mut Page> {
         let node_idx = node_idx(page_idx);
         let mut state = self.page_states.get(node_idx);
@@ -405,6 +527,7 @@ impl PagedMemory {
         Ok(self.page_cache.get_mut(cache_idx).unwrap())
     }
 
+    #[allow(deprecated)]
     fn write_registers(&mut self) {
         // Copy register values first to avoid borrow conflicts
         let user_registers = self.user_registers;
@@ -419,6 +542,7 @@ impl PagedMemory {
         }
     }
 
+    #[allow(deprecated)]
     pub(crate) fn commit(&mut self) -> (MemoryImage2, Digest, Digest) {
         // tracing::trace!("commit: {self:#?}");
 

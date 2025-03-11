@@ -29,7 +29,7 @@ pub trait EmuContext {
     fn trap(&mut self, cause: Exception) -> Result<bool>;
 
     // Callback when instructions are decoded
-    fn on_insn_decoded(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()>;
+    //fn on_insn_decoded(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()>;
 
     // Callback when instructions end normally
     fn on_normal_end(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()>;
@@ -180,6 +180,7 @@ pub enum InsnKind {
 #[derive(Clone, Copy, Debug)]
 pub struct Instruction {
     pub kind: InsnKind,
+    #[allow(dead_code)]
     category: InsnCategory,
     pub opcode: u32,
     pub func3: u32,
@@ -246,7 +247,7 @@ const fn insn(
 }
 
 type InstructionTable = [Instruction; 48];
-type FastInstructionTable = [u8; 1 << 10];
+type FastInstructionTable = [u8; 0x400];
 
 const RV32IM_ISA: InstructionTable = [
     insn(InsnKind::Invalid, InsnCategory::Invalid, 0x00, 0x0, 0x00),
@@ -553,8 +554,7 @@ impl Emulator {
         let word = ctx.load_memory(pc.waddr())?;
         let decoded = DecodedInstruction::new(word);
         let insn = self.table.lookup(&decoded);
-        ctx.on_insn_decoded(&insn, &decoded)?;
-
+        //ctx.on_insn_decoded(&insn, &decoded)?;
         // Use exec_rv32im instead of category-based dispatch
         let kind_opt = self.exec_rv32im(ctx, word)?;
 
