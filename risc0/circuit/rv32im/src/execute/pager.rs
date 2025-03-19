@@ -15,7 +15,6 @@
 use std::collections::BTreeSet;
 
 use anyhow::{bail, Result};
-use bit_vec::BitVec;
 use derive_more::Debug;
 use risc0_binfmt::{MemoryImage, Page, WordAddr};
 use risc0_zkp::core::digest::Digest;
@@ -67,16 +66,61 @@ pub(crate) enum PageTraceEvent {
     PageOut { cycles: u32 },
 }
 
+#[derive(Clone, Debug)]
+struct BitArray {
+    data: Vec<u8>,
+    len: usize,
+}
+
+impl BitArray {
+    fn new(size: usize) -> Self {
+        // Calculate number of bytes needed to store 'size' bits
+        let bytes = (size + 7) / 8;
+        Self {
+            data: vec![0; bytes],
+            len: size,
+        }
+    }
+
+    fn get(&self, index: usize) -> bool {
+        if index >= self.len {
+            panic!("BitArray index out of bounds");
+        }
+        let byte_idx = index / 8;
+        let bit_idx = index % 8;
+        (self.data[byte_idx] & (1 << bit_idx)) != 0
+    }
+
+    fn set(&mut self, index: usize, value: bool) {
+        if index >= self.len {
+            panic!("BitArray index out of bounds");
+        }
+        let byte_idx = index / 8;
+        let bit_idx = index % 8;
+        if value {
+            self.data[byte_idx] |= 1 << bit_idx;
+        } else {
+            self.data[byte_idx] &= !(1 << bit_idx);
+        }
+    }
+
+    fn clear(&mut self) {
+        for byte in &mut self.data {
+            *byte = 0;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PageStates {
-    states: BitVec,
+    states: BitArray,
     indexes: Vec<u32>,
 }
 
 impl PageStates {
     pub(crate) fn new(size: usize) -> Self {
         Self {
-            states: BitVec::from_elem(size * 2, false),
+            states: BitArray::new(size * 2),
             indexes: vec![],
         }
     }
@@ -102,10 +146,10 @@ impl PageStates {
     }
 
     pub(crate) fn get(&self, index: u32) -> PageState {
-        if self.states.get(index as usize * 2).unwrap() {
+        if self.states.get(index as usize * 2) {
             // b10 | b11 => Dirty
             PageState::Dirty
-        } else if self.states.get(index as usize * 2 + 1).unwrap() {
+        } else if self.states.get(index as usize * 2 + 1) {
             // b01 => Loaded
             PageState::Loaded
         } else {
