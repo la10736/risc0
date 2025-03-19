@@ -72,6 +72,10 @@ struct BitArray {
     len: usize,
 }
 
+/// from the docs:
+/// BitVec is always a heap allocation. If you know your sizes at compile-time,
+/// you may prefer to use BitArray instead, which is able to store its data
+/// as an immediate value rather than through an indirection.
 impl BitArray {
     fn new(size: usize) -> Self {
         // Calculate number of bytes needed to store 'size' bits
@@ -279,9 +283,13 @@ impl PagedMemory {
         let mut user_registers = [0; REG_MAX];
         let page_idx = MACHINE_REGS_ADDR.waddr().page_idx();
         let page = image.get_page(page_idx).unwrap();
+        let machine_data = page.data();
+        let user_data = page.data();
         for idx in 0..REG_MAX {
-            machine_registers[idx] = page.load(MACHINE_REGS_ADDR.waddr() + idx);
-            user_registers[idx] = page.load(USER_REGS_ADDR.waddr() + idx);
+            machine_registers[idx] =
+                u32::from_le_bytes(machine_data[4 * idx..4 * (idx + 1)].try_into().unwrap());
+            user_registers[idx] =
+                u32::from_le_bytes(user_data[4 * idx..4 * (idx + 1)].try_into().unwrap());
         }
 
         Self {
