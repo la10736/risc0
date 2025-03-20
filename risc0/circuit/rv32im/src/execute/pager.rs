@@ -69,7 +69,6 @@ pub(crate) enum PageTraceEvent {
 #[derive(Clone, Debug)]
 struct BitArray {
     data: Vec<u8>,
-    len: usize,
 }
 
 /// from the docs:
@@ -82,23 +81,16 @@ impl BitArray {
         let bytes = (size + 7) / 8;
         Self {
             data: vec![0; bytes],
-            len: size,
         }
     }
 
     fn get(&self, index: usize) -> bool {
-        if index >= self.len {
-            panic!("BitArray index out of bounds");
-        }
         let byte_idx = index / 8;
         let bit_idx = index % 8;
         (self.data[byte_idx] & (1 << bit_idx)) != 0
     }
 
     fn set(&mut self, index: usize, value: bool) {
-        if index >= self.len {
-            panic!("BitArray index out of bounds");
-        }
         let byte_idx = index / 8;
         let bit_idx = index % 8;
         if value {
@@ -283,13 +275,18 @@ impl PagedMemory {
         let mut user_registers = [0; REG_MAX];
         let page_idx = MACHINE_REGS_ADDR.waddr().page_idx();
         let page = image.get_page(page_idx).unwrap();
-        let machine_data = page.data();
-        let user_data = page.data();
-        for idx in 0..REG_MAX {
-            machine_registers[idx] =
-                u32::from_le_bytes(machine_data[4 * idx..4 * (idx + 1)].try_into().unwrap());
-            user_registers[idx] =
-                u32::from_le_bytes(user_data[4 * idx..4 * (idx + 1)].try_into().unwrap());
+
+        // Load registers in chunks of 4 for better cache utilization
+        for chunk in 0..8 {
+            let base = chunk * 4;
+            machine_registers[base] = page.load(MACHINE_REGS_ADDR.waddr() + base);
+            user_registers[base] = page.load(USER_REGS_ADDR.waddr() + base);
+            machine_registers[base + 1] = page.load(MACHINE_REGS_ADDR.waddr() + base + 1);
+            user_registers[base + 1] = page.load(USER_REGS_ADDR.waddr() + base + 1);
+            machine_registers[base + 2] = page.load(MACHINE_REGS_ADDR.waddr() + base + 2);
+            user_registers[base + 2] = page.load(USER_REGS_ADDR.waddr() + base + 2);
+            machine_registers[base + 3] = page.load(MACHINE_REGS_ADDR.waddr() + base + 3);
+            user_registers[base + 3] = page.load(USER_REGS_ADDR.waddr() + base + 3);
         }
 
         Self {
@@ -439,7 +436,7 @@ impl PagedMemory {
         }
     }
 
-    fn page_for_writing(&mut self, page_idx: u32) -> Result<&mut Page> {
+    pub(crate) fn page_for_writing(&mut self, page_idx: u32) -> Result<&mut Page> {
         let node_idx = node_idx(page_idx);
         let mut state = self.page_states.get(node_idx);
         if state == PageState::Unloaded {

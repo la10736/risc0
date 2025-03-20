@@ -29,7 +29,7 @@ use crate::{
 
 use super::{
     bigint,
-    pager::{compute_partial_image, PageTraceEvent, PagedMemory},
+    pager::{compute_partial_image, PageTraceEvent, PagedMemory, PAGE_WORDS},
     platform::*,
     poseidon2::Poseidon2State,
     r0vm::{EcallKind, LoadOp, Risc0Context, Risc0Machine},
@@ -394,8 +394,26 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
 
     fn resume(&mut self) -> Result<()> {
         let input_words = self.input_digest.as_words().to_vec();
-        for (i, word) in input_words.iter().enumerate() {
-            self.store_u32(GLOBAL_INPUT_ADDR.waddr() + i, *word)?;
+        // Store input words in chunks to reduce page lookups
+        let mut addr = GLOBAL_INPUT_ADDR.waddr();
+        let mut remaining = input_words;
+
+        while !remaining.is_empty() {
+            let page_idx = addr.page_idx();
+            let page_offset = addr.0 % PAGE_WORDS as u32;
+            let words_in_page = PAGE_WORDS as u32 - page_offset;
+            let chunk_size = words_in_page.min(remaining.len() as u32) as usize;
+
+            // Get the page once for the chunk
+            let page = self.pager.page_for_writing(page_idx)?;
+
+            // Store words in the chunk
+            for (i, word) in remaining.drain(..chunk_size).enumerate() {
+                page.store(addr + i, word);
+            }
+
+            // Update for next chunk
+            addr += chunk_size as u32;
         }
         Ok(())
     }
