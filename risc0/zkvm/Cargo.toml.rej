@@ -1,0 +1,21 @@
+--- risc0/zkvm/Cargo.toml
++++ risc0/zkvm/Cargo.toml
+@@ -130,6 +134,10 @@ cuda = [
+   "risc0-zkp/cuda",
+ ]
+ platform = ["risc0-zkvm-platform/rust-runtime", "risc0-zkvm-platform/export-getrandom"]
++guest = [
++  "risc0-zkvm-platform/rust-runtime",
++  "risc0-zkvm-platform/export-getrandom",
++]
+ default = ["client"]
+ r0vm-ver-compat = []
+ disable-dev-mode = []
+@@ -161,6 +169,7 @@ prove = [
+   "dep:rustc-demangle",
+   "dep:tempfile",
+   "dep:typetag",
++  "dep:rrs-lib",
+   "risc0-circuit-recursion/prove",
+   "risc0-circuit-rv32im/prove",
+   "risc0-core/perf",
