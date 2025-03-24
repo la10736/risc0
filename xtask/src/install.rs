@@ -29,6 +29,7 @@ impl Install {
 fn install_sccache() {
     if which("sccache").is_err() {
         let sh = Shell::new().unwrap();
+        #[allow(unexpected_cfgs)]
         cmd!(sh, "cargo install --locked sccache").run().unwrap();
     }
 }
@@ -36,6 +37,7 @@ fn install_sccache() {
 fn install_wasm_tools() {
     if which("wasm-pack").is_err() {
         let sh = Shell::new().unwrap();
+        #[allow(unexpected_cfgs)]
         cmd!(sh, "cargo install --locked wasm-pack").run().unwrap();
     }
 }

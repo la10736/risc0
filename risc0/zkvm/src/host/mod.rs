@@ -11,12 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![cfg(any(feature = "client", feature = "prove"))]
 
-#[cfg(any(feature = "client", feature = "prove"))]
+
 pub(crate) mod api;
 #[cfg(feature = "client")]
 pub(crate) mod client;
-#[cfg(any(feature = "client", feature = "prove"))]
 mod protos;
 pub(crate) mod prove_info;
 pub mod recursion;

@@ -72,6 +72,7 @@
 
 extern crate alloc;
 
+#[cfg(any(target_os = "zkvm", feature = "guest"))]
 pub mod guest;
 #[cfg(not(target_os = "zkvm"))]
 mod host;
@@ -90,6 +91,11 @@ pub use bytes::Bytes;
 pub use risc0_binfmt::{ExitCode, InvalidExitCodeError, SystemState};
 pub use risc0_zkvm_platform::{align_up, declare_syscall, memory::GUEST_MAX_MEM, PAGE_SIZE};
 
+#[cfg(all(not(target_os = "zkvm"), any(feature = "client", feature = "prove")))]
+pub use self::host::{
+    prove_info::{ProveInfo, SessionStats},
+    recursion::{ALLOWED_CONTROL_IDS, ALLOWED_CONTROL_ROOT},
+};
 pub use self::receipt_claim::{
     Assumption, Assumptions, Input, MaybePruned, Output, PrunedValueError, ReceiptClaim,
 };
@@ -132,12 +138,7 @@ pub use {
 };
 #[cfg(not(target_os = "zkvm"))]
 pub use {
-    self::host::{
-        prove_info::{ProveInfo, SessionStats},
-        recursion::{ALLOWED_CONTROL_IDS, ALLOWED_CONTROL_ROOT},
-    },
-    risc0_binfmt::compute_image_id,
-    risc0_circuit_rv32im::control_id::POSEIDON2_CONTROL_IDS,
+    risc0_binfmt::compute_image_id, risc0_circuit_rv32im::control_id::POSEIDON2_CONTROL_IDS,
     risc0_groth16::Seal as Groth16Seal,
 };
 
