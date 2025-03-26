@@ -49,8 +49,11 @@ risc0-core = { workspace = true }
 risc0-groth16 = { workspace = true }
 risc0-zkos-v1compat = { workspace = true }
 risc0-zkp = { workspace = true }
-risc0-zkvm-platform = { workspace = true }
-rrs-lib = { version = "0.1", optional = true }
+risc0-zkvm-platform = { workspace = true, features = [
+  "rust-runtime",
+  "export-getrandom",
+] }
+rrs-lib = "0.1"
 semver = { version = "1.0", default-features = false }
 serde = { version = "1.0", default-features = false, features = [
   "alloc",
@@ -60,10 +63,6 @@ stability = "0.2"
 tracing = { version = "0.1", default-features = false, features = [
   "attributes",
 ] }
-
-# Guest dependencies
-[target.'cfg(target_os = "zkvm")'.dependencies]
-risc0-zkvm-platform = { workspace = true, features = ["rust-runtime", "export-getrandom"] }
 
 # Host dependencies
 [target.'cfg(not(target_os = "zkvm"))'.dependencies]
@@ -149,10 +148,6 @@ cuda = [
   "risc0-circuit-rv32im/cuda",
   "risc0-zkp/cuda",
 ]
-guest = [
-  "risc0-zkvm-platform/rust-runtime",
-  "risc0-zkvm-platform/export-getrandom",
-]
 default = ["client", "bonsai"]
 r0vm-ver-compat = []
 disable-dev-mode = []
@@ -187,7 +182,6 @@ prove = [
   "dep:rustc-demangle",
   "dep:tempfile",
   "dep:typetag",
-  "dep:rrs-lib",
   "risc0-circuit-keccak/prove",
   "risc0-circuit-recursion/prove",
   "risc0-circuit-rv32im/prove",

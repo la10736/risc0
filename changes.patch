@@ -1,0 +1,153 @@
+diff --git a/risc0/cargo-risczero/src/utils.rs b/risc0/cargo-risczero/src/utils.rs
+index 3317781d..6af85957 100644
+--- a/risc0/cargo-risczero/src/utils.rs
++++ b/risc0/cargo-risczero/src/utils.rs
+@@ -111,6 +111,7 @@ pub struct FileLock(File);
+
+ impl Drop for FileLock {
+     fn drop(&mut self) {
++        #[allow(unstable_name_collisions)]
+         drop(self.0.unlock());
+     }
+ }
+diff --git a/risc0/zkvm/Cargo.toml b/risc0/zkvm/Cargo.toml
+index ebc3a1bd..7531024b 100644
+--- a/risc0/zkvm/Cargo.toml
++++ b/risc0/zkvm/Cargo.toml
+@@ -41,7 +41,7 @@ risc0-core = { workspace = true }
+ risc0-groth16 = { workspace = true }
+ risc0-zkp = { workspace = true }
+ risc0-zkvm-platform = { workspace = true }
+-rrs-lib = "0.1"
++rrs-lib = { version = "0.1", optional = true }
+ semver = { version = "1.0", default-features = false }
+ serde = { version = "1.0", default-features = false, features = [
+   "alloc",
+@@ -52,6 +52,10 @@ tracing = { version = "0.1", default-features = false, features = [
+   "attributes",
+ ] }
+
++# Guest dependencies
++[target.'cfg(target_os = "zkvm")'.dependencies]
++risc0-zkvm-platform = { workspace = true, features = ["rust-runtime", "export-getrandom"] }
++
+ # Host dependencies
+ [target.'cfg(not(target_os = "zkvm"))'.dependencies]
+ addr2line = { version = "0.22", features = ["rustc-demangle"], optional = true }
+@@ -126,6 +130,10 @@ cuda = [
+   "risc0-zkp/cuda",
+ ]
+ platform = ["risc0-zkvm-platform/rust-runtime", "risc0-zkvm-platform/export-getrandom"]
++guest = [
++  "risc0-zkvm-platform/rust-runtime",
++  "risc0-zkvm-platform/export-getrandom",
++]
+ default = ["client"]
+ r0vm-ver-compat = []
+ disable-dev-mode = []
+@@ -157,6 +165,7 @@ prove = [
+   "dep:rustc-demangle",
+   "dep:tempfile",
+   "dep:typetag",
++  "dep:rrs-lib",
+   "risc0-circuit-recursion/prove",
+   "risc0-circuit-rv32im/prove",
+   "risc0-core/perf",
+diff --git a/risc0/zkvm/methods/Cargo.toml b/risc0/zkvm/methods/Cargo.toml
+index a54c3a4c..fc4fa85a 100644
+--- a/risc0/zkvm/methods/Cargo.toml
++++ b/risc0/zkvm/methods/Cargo.toml
+@@ -18,7 +18,7 @@ bincode = { version = "1.3", optional = true }
+ borsh = { version = "1.5", default-features = false }
+ ciborium = { version = "0.2", default-features = false }
+ postcard = "1.0"
+-risc0-zkvm = { workspace = true, features = ["unstable"] }
++risc0-zkvm = { workspace = true, features = ["unstable", "guest"] }
+ risc0-zkvm-platform = { workspace = true }
+ rmp-serde = "1.3"
+ serde = { version = "1.0", default-features = false, features = ["derive"] }
+diff --git a/risc0/zkvm/src/guest/env/mod.rs b/risc0/zkvm/src/guest/env/mod.rs
+index 6a8198f7..eab591bf 100644
+--- a/risc0/zkvm/src/guest/env/mod.rs
++++ b/risc0/zkvm/src/guest/env/mod.rs
+@@ -68,7 +68,6 @@
+ //! [proof composition]:https://www.risczero.com/blog/proof-composition
+ //! [guest-optimization]:
+ //!     https://dev.risczero.com/api/zkvm/optimization#when-reading-data-as-raw-bytes-use-envread_slice
+-#![cfg(feature="platform")]
+
+ mod read;
+ mod verify;
+diff --git a/risc0/zkvm/src/host/mod.rs b/risc0/zkvm/src/host/mod.rs
+index 910b19ea..4922ab2b 100644
+--- a/risc0/zkvm/src/host/mod.rs
++++ b/risc0/zkvm/src/host/mod.rs
+@@ -11,12 +11,11 @@
+ // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
++#![cfg(any(feature = "client", feature = "prove"))]
+
+-#[cfg(any(feature = "client", feature = "prove"))]
+ pub(crate) mod api;
+ #[cfg(feature = "client")]
+ pub(crate) mod client;
+-#[cfg(any(feature = "client", feature = "prove"))]
+ mod protos;
+ pub(crate) mod prove_info;
+ pub mod recursion;
+diff --git a/risc0/zkvm/src/lib.rs b/risc0/zkvm/src/lib.rs
+index 589999f6..e2cb36e0 100644
+--- a/risc0/zkvm/src/lib.rs
++++ b/risc0/zkvm/src/lib.rs
+@@ -72,6 +72,7 @@
+
+ extern crate alloc;
+
++#[cfg(any(target_os = "zkvm", feature = "guest"))]
+ pub mod guest;
+ #[cfg(not(target_os = "zkvm"))]
+ mod host;
+diff --git a/rust-toolchain.toml b/rust-toolchain.toml
+index 35bd206c..23fc36d3 100644
+--- a/rust-toolchain.toml
++++ b/rust-toolchain.toml
+@@ -1,5 +1,5 @@
+ [toolchain]
+-channel = "1.81"
++channel = "1.84"
+ components = ["clippy", "rustfmt", "rust-src"]
+ targets = ["wasm32-unknown-unknown"]
+ profile = "minimal"
+diff --git a/rzup/src/utils.rs b/rzup/src/utils.rs
+index c19d7439..f54243d2 100644
+--- a/rzup/src/utils.rs
++++ b/rzup/src/utils.rs
+@@ -68,6 +68,7 @@ pub struct FileLock(File);
+
+ impl Drop for FileLock {
+     fn drop(&mut self) {
++        #[allow(unstable_name_collisions)]
+         drop(self.0.unlock());
+     }
+ }
+diff --git a/xtask/src/install.rs b/xtask/src/install.rs
+index 5d6d3c48..e7ae7d4d 100644
+--- a/xtask/src/install.rs
++++ b/xtask/src/install.rs
+@@ -29,6 +29,7 @@ impl Install {
+ fn install_sccache() {
+     if which("sccache").is_err() {
+         let sh = Shell::new().unwrap();
++        #[allow(unexpected_cfgs)]
+         cmd!(sh, "cargo install --locked sccache").run().unwrap();
+     }
+ }
+@@ -36,6 +37,7 @@ fn install_sccache() {
+ fn install_wasm_tools() {
+     if which("wasm-pack").is_err() {
+         let sh = Shell::new().unwrap();
++        #[allow(unexpected_cfgs)]
+         cmd!(sh, "cargo install --locked wasm-pack").run().unwrap();
+     }
+ }

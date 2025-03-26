@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![cfg_attr(not(feature = "prove"), no_std)]
+
 
 mod control_id;
 #[cfg(feature = "prove")]
@@ -33,7 +35,8 @@ pub const KECCAK_PERMUTE_CYCLES: usize = 200;
 pub type KeccakState = [u64; 25];
 
 pub fn get_control_id(po2: usize) -> &'static Digest {
-    assert!(KECCAK_PO2_RANGE.contains(&po2), "po2 {po2} out of range");
+    use core::iter::Iterator;
+    core::assert!(KECCAK_PO2_RANGE.contains(&po2), "po2 {po2} out of range");
     &KECCAK_CONTROL_IDS[po2 - KECCAK_PO2_RANGE.min().unwrap()]
 }
 
